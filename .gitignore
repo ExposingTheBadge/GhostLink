@@ -54,3 +54,5 @@ clients/android/sdk/
 *.tmp
 temp/
 tmp/
+clients/qt6/build/
+clients/qt-test/
