@@ -59,6 +59,13 @@ private val DarkColors = darkColorScheme(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Block screenshots + screen-share from recording the chat. Most
+        // OS-level malware and "screen recorder" apps will see a black
+        // frame instead of message content.
+        window.setFlags(
+            android.view.WindowManager.LayoutParams.FLAG_SECURE,
+            android.view.WindowManager.LayoutParams.FLAG_SECURE,
+        )
         setContent {
             MaterialTheme(colorScheme = DarkColors) {
                 val vm: GhostlinkVM = viewModel(factory = GhostlinkVM.Factory(application))

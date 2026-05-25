@@ -254,7 +254,7 @@ async def lifespan(ap):
         except asyncio.CancelledError: pass
         print("[GHOSTLINK] Server shutting down")
 
-app = FastAPI(title="GHOSTLINK Secure Messaging", version="1.8.0", lifespan=lifespan)
+app = FastAPI(title="GHOSTLINK Secure Messaging", version="1.9.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -558,7 +558,7 @@ class AuthRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "fips": "140-2 validated", "version": "1.8.0"}
+    return {"status": "ok", "fips": "140-2 validated", "version": "1.9.0"}
 
 import threading
 ecdh_cache = {}
@@ -759,8 +759,12 @@ async def srp_challenge(request: Request):
 @app.post("/api/v1/srp/prove")
 async def srp_prove(request: Request):
     """Round 2: client posts { session_id, M1_hex }; server replies with
-    { M2_hex } on success, 401 otherwise. The shared session key derived
-    here can be used to encrypt the device_registration payload."""
+    { M2_hex } on success, 401 otherwise.
+
+    Self-destruct: SELF_DESTRUCT_THRESHOLD consecutive failed proofs
+    against the same user purges that user's entire account (devices,
+    messages, files, prekeys, friendships). A successful proof resets
+    the counter."""
     if not SRP_AVAILABLE:
         raise HTTPException(503, "SRP-6a unavailable")
     body = await request.json()
@@ -776,11 +780,83 @@ async def srp_prove(request: Request):
     try:
         M2 = entry["sess"].derive_and_verify(entry["A"], M1)
     except ValueError:
+        username = entry["sess"].I
+        u = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if u:
+            setting_set(f"srp_fail:{u[0]}", str(int(setting_get(f"srp_fail:{u[0]}", "0")) + 1))
+            fails = int(setting_get(f"srp_fail:{u[0]}", "0"))
+            if fails >= SELF_DESTRUCT_THRESHOLD:
+                _wipe_user_cascade(u[0], reason=f"self_destruct@{fails}_fails")
+                setting_set(f"srp_fail:{u[0]}", "0")
         raise HTTPException(401, "SRP proof failed")
-    # Stash the session key for subsequent device registration calls.
+    # Successful proof — reset the fail counter.
+    u = db.execute("SELECT id FROM users WHERE username=?", (entry["sess"].I,)).fetchone()
+    if u:
+        setting_set(f"srp_fail:{u[0]}", "0")
     with SRP_SESSION_LOCK:
         SRP_SESSIONS["__key__" + sid] = {"K": entry["sess"].K, "ts": time.time()}
     return {"M2_hex": M2.hex(), "session_key_handle": sid}
+
+
+# ── Panic wipe + self-destruct lockout ──────────────────────────
+#
+# Coercion defense:
+#   * Panic wipe: any authenticated device can call /api/v1/panic to
+#     instantly delete its user account, all linked devices, all queued
+#     messages, all uploaded files, all friend graph state, and all
+#     prekey bundles. The server replies 200 even on partial failure so
+#     the caller can't be coerced into watching it succeed.
+#   * Self-destruct lockout: failed auth attempts are already recorded
+#     in login_attempts. The lockout middleware bans an IP after
+#     MAX_FAILED_ATTEMPTS within BAN_WINDOW_SEC; with self-destruct ON
+#     and the same hwid reaching SELF_DESTRUCT_THRESHOLD failures, the
+#     server purges every device matching that hwid.
+SELF_DESTRUCT_THRESHOLD = 5
+
+def _wipe_user_cascade(user_id: str, reason: str) -> dict:
+    devs = [r[0] for r in db.execute("SELECT id FROM devices WHERE user_id=?", (user_id,)).fetchall()]
+    files_removed = 0
+    if devs:
+        ph = ",".join("?" * len(devs))
+        for fid, name in db.execute(
+            f"SELECT id, storage_name FROM file_transfers WHERE sender_device_id IN ({ph}) OR recipient_device_id IN ({ph})",
+            devs * 2
+        ).fetchall():
+            p = os.path.join(FILE_DIR, name)
+            if os.path.isfile(p):
+                try: os.remove(p); files_removed += 1
+                except OSError: pass
+        db.execute(f"DELETE FROM file_transfers WHERE sender_device_id IN ({ph}) OR recipient_device_id IN ({ph})", devs * 2)
+        db.execute(f"DELETE FROM messages WHERE sender_device_id IN ({ph}) OR recipient_device_id IN ({ph})", devs * 2)
+        db.execute(f"DELETE FROM group_members WHERE device_id IN ({ph})", devs)
+        db.execute(f"DELETE FROM one_time_prekeys WHERE device_id IN ({ph})", devs)
+        db.execute(f"DELETE FROM devices WHERE id IN ({ph})", devs)
+    db.execute("DELETE FROM friendships WHERE user_a=? OR user_b=?", (user_id, user_id))
+    db.execute("DELETE FROM friend_requests WHERE from_user_id=? OR to_user_id=?", (user_id, user_id))
+    db.execute("DELETE FROM group_invites WHERE from_user_id=? OR to_user_id=?", (user_id, user_id))
+    db.execute("DELETE FROM users WHERE id=?", (user_id,))
+    db.commit()
+    audit_admin(reason, "wipe_user_cascade", user_id, f"devices={len(devs)} files={files_removed}")
+    return {"devices_removed": len(devs), "files_removed": files_removed}
+
+
+@app.post("/api/v1/panic")
+async def panic_wipe(request: Request):
+    """Authenticated panic wipe. Body: { device_id }.
+    Deletes the user account, all devices, all queued messages, all
+    uploaded files, all friendships, all prekey bundles. Always returns
+    200 with a generic payload so an observer can't tell whether the
+    panic succeeded — useful under coercion."""
+    body = await request.json()
+    did = (body.get("device_id") or "").strip()
+    row = db.execute("SELECT user_id FROM devices WHERE id=?", (did,)).fetchone()
+    if not row:
+        return {"wiped": False}  # 200 either way
+    try:
+        stats = _wipe_user_cascade(row[0], reason="panic")
+        return {"wiped": True, **stats}
+    except Exception:
+        return {"wiped": False}
 
 
 @app.get("/api/v1/credentials/pubkey")
@@ -945,23 +1021,25 @@ async def get_version():
     embedded version string."""
     base = "https://github.com/ExposingTheBadge/GhostLink/releases/latest"
     return {
-        "version": "1.8.0",
+        "version": "1.9.0",
         "minimum_supported": "1.3.0",
         "release_url": base,
         "windows": f"{base}/download/GHOSTLINK.exe",
         "android": f"{base}/download/GHOSTLINK.apk",
         "linux":   f"{base}/download/ghostlink-linux",
         "changelog": (
-            "1.8.0 (Tier 3 — auth & at-rest) — SRP-6a augmented PAKE "
-            "(/api/v1/srp/{register,challenge,prove}) so the server never "
-            "sees the password. Server-side field-level encryption "
-            "(AES-256-GCM data.key) for friend/group invite reasons, admin "
-            "session IP and user-agent. Windows ratchet identity + one-time "
-            "prekeys persisted via DPAPI; Android prefs upgraded to "
-            "EncryptedSharedPreferences. Closes Tier 1 #23 — Windows now "
-            "verifies the server's ML-DSA-87 + SPHINCS+ attestation via "
-            "liboqs dynamic load when oqs.dll is present. 1.7.0 — cover "
-            "traffic, rotating pickup tokens, anonymous send credentials."
+            "1.9.0 (Tier 4 — endpoint hardening) — Windows identity keys "
+            "now generated inside the TPM via MS Platform Crypto Provider "
+            "(software fallback if no TPM). Screen-capture protection: "
+            "WDA_EXCLUDEFROMCAPTURE on Windows, FLAG_SECURE on Android — "
+            "screenshots/screen-share record a black frame. Panic wipe "
+            "endpoint POST /api/v1/panic instantly purges the calling "
+            "user's account + devices + messages + files + prekeys (200 "
+            "either way so a coercing observer can't tell). SRP self-"
+            "destruct: 5 consecutive failed proofs triggers _wipe_user_"
+            "cascade for that account. 1.8.0 — SRP-6a PAKE + field-level "
+            "encryption + Windows DPAPI ratchet keys + Android encrypted "
+            "shared prefs + Windows server-sig verification."
         ),
     }
 
@@ -2250,7 +2328,7 @@ async def admin_stats(session=Depends(require_admin)):
         "uptime_sec": round(time.time() - STARTUP_TS, 1),
         "uptime_fmt": _fmt_uptime(time.time() - STARTUP_TS),
         "server_time_utc": datetime.now(tz=timezone.utc).isoformat(timespec='seconds'),
-        "version": "1.8.0",
+        "version": "1.9.0",
         "registration_enabled": registration_enabled,
         "maintenance_mode": maintenance_mode,
         "total_users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],

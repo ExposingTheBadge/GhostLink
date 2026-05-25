@@ -89,6 +89,10 @@ char*  crypto_hex_encode(const BYTE *data, DWORD len);
 BOOL   crypto_hex_decode(const char *hex, BYTE *data, DWORD *len);
 BOOL   crypto_auth_derive_key(NCRYPT_KEY_HANDLE my_priv, const BYTE *peer_blob, DWORD blob_len, BYTE key_out[32]);
 
+/* Returns 1 if the most-recently-generated keypair lives inside the TPM,
+ * 0 if software fallback. Updated by crypto_generate_keypair(). */
+int    crypto_keypair_origin(void);
+
 /* Post-quantum hybrid client KEX.
  *   server_blob:        the server_public_key_blob bytes from /api/v1/key-exchange-v2
  *                       (4B magic 'PKG2' + 4B ec_len(96) + 96B ec_xy + 4B kem_len(1568) + 1568B kem_pk)

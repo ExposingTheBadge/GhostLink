@@ -6,7 +6,7 @@
 #include <QtNetwork>
 #include <QtCore>
 
-#define CLIENT_VERSION "1.8.0"
+#define CLIENT_VERSION "1.9.0"
 
 extern "C" {
 #include "client.h"
@@ -215,6 +215,14 @@ public:
         setWindowTitle("GHOSTLINK Secure Messenger");
         resize(880, 620);
         qApp->setStyleSheet(themeCSS(gDark));
+
+        /* Block screen-capture / screen-share tools from recording this
+           window. WDA_EXCLUDEFROMCAPTURE is Win 10 2004+; degrades to
+           WDA_MONITOR (black-out on capture) on older builds. */
+        HWND hwnd = (HWND)this->winId();
+        if (!SetWindowDisplayAffinity(hwnd, /*WDA_EXCLUDEFROMCAPTURE=*/0x00000011)) {
+            SetWindowDisplayAffinity(hwnd, /*WDA_MONITOR=*/0x00000001);
+        }
 
         /* Init crypto + network */
         crypto_init();

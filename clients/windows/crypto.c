@@ -21,37 +21,63 @@ void crypto_random_bytes(BYTE *buf, DWORD len) {
     BCryptGenRandom(NULL, buf, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 }
 
-/* ── ECDH P-384 Key Generation ────────────────────────────────────── */
+/* ── ECDH P-384 Key Generation ──────────────────────────────────────
+ * Tries to generate inside the TPM via the Microsoft Platform Crypto
+ * Provider so the private scalar never leaves silicon. If the TPM isn't
+ * present or refuses the algorithm we fall back to the software provider.
+ *
+ * crypto_keypair_origin() reports which one we ended up using so the UI
+ * can display TPM-backed vs software-backed status. */
+static int g_last_kp_origin = 0;  /* 0 = software, 1 = TPM */
+
+int crypto_keypair_origin(void) { return g_last_kp_origin; }
+
 KeyPair crypto_generate_keypair(void) {
     KeyPair kp = {0};
     SECURITY_STATUS s;
     NCRYPT_PROV_HANDLE hProv = NULL;
 
+    /* 1. Try TPM-backed Platform Crypto Provider. */
+    s = NCryptOpenStorageProvider(&hProv, MS_PLATFORM_CRYPTO_PROVIDER, 0);
+    if (BCRYPT_SUCCESS(s)) {
+        s = NCryptCreatePersistedKey(hProv, &kp.handle, NCRYPT_ECDH_P384_ALGORITHM, NULL, 0, 0);
+        if (BCRYPT_SUCCESS(s)) {
+            /* Ask the TPM to mark the key non-exportable. */
+            DWORD nonExport = NCRYPT_ALLOW_DECRYPT_FLAG;
+            NCryptSetProperty(kp.handle, NCRYPT_EXPORT_POLICY_PROPERTY,
+                              (PUCHAR)&nonExport, sizeof(nonExport), 0);
+            s = NCryptFinalizeKey(kp.handle, 0);
+            if (BCRYPT_SUCCESS(s)) {
+                kp.pub.len = PUBLIC_KEY_MAX;
+                if (BCRYPT_SUCCESS(NCryptExportKey(kp.handle, NULL, BCRYPT_ECCPUBLIC_BLOB, NULL,
+                                                   kp.pub.data, PUBLIC_KEY_MAX, &kp.pub.len, 0))) {
+                    NCryptFreeObject(hProv);
+                    g_last_kp_origin = 1;
+                    return kp;
+                }
+            }
+            NCryptDeleteKey(kp.handle, 0);
+            kp.handle = NULL;
+        }
+        NCryptFreeObject(hProv);
+        hProv = NULL;
+    }
+
+    /* 2. Software fallback — Microsoft Software Key Storage Provider. */
     s = NCryptOpenStorageProvider(&hProv, MS_KEY_STORAGE_PROVIDER, 0);
     if (!BCRYPT_SUCCESS(s)) return kp;
-
-    /* Create a temporary P-384 ECDH key */
     s = NCryptCreatePersistedKey(hProv, &kp.handle, NCRYPT_ECDH_P384_ALGORITHM, NULL, 0, 0);
-    if (!BCRYPT_SUCCESS(s)) {
-        NCryptFreeObject(hProv);
-        return kp;
-    }
-
-    /* Finalize (generate) the key */
+    if (!BCRYPT_SUCCESS(s)) { NCryptFreeObject(hProv); return kp; }
     s = NCryptFinalizeKey(kp.handle, 0);
     if (!BCRYPT_SUCCESS(s)) {
-        NCryptDeleteKey(kp.handle, 0);
-        NCryptFreeObject(hProv);
-        kp.handle = NULL;
-        return kp;
+        NCryptDeleteKey(kp.handle, 0); NCryptFreeObject(hProv);
+        kp.handle = NULL; return kp;
     }
-
-    /* Export public key */
     kp.pub.len = PUBLIC_KEY_MAX;
-    s = NCryptExportKey(kp.handle, NULL, BCRYPT_ECCPUBLIC_BLOB, NULL,
-                        kp.pub.data, PUBLIC_KEY_MAX, &kp.pub.len, 0);
-
+    NCryptExportKey(kp.handle, NULL, BCRYPT_ECCPUBLIC_BLOB, NULL,
+                    kp.pub.data, PUBLIC_KEY_MAX, &kp.pub.len, 0);
     NCryptFreeObject(hProv);
+    g_last_kp_origin = 0;
     return kp;
 }
 
