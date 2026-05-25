@@ -16,6 +16,7 @@ set(WIN_MODULES
     tpm.c
     kyber1024.c
     ratchet.c
+    oqs_sig.c
 )
 
 add_executable(ghostlink

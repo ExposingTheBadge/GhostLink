@@ -505,8 +505,32 @@ private:
             QByteArray kxV2 = httpGet("/api/v1/key-exchange-v2");
             QString sidV2 = jsonStr(kxV2, "session_id");
             QString blobHexV2 = jsonStr(kxV2, "server_public_key_blob");
+            QString sigHexV2 = jsonStr(kxV2, "server_signature");
             if (!sidV2.isEmpty() && !blobHexV2.isEmpty()) {
                 QByteArray blobBytesQ = QByteArray::fromHex(blobHexV2.toUtf8());
+
+                /* If liboqs.dll is available, cryptographically verify the
+                   server's attestation against the long-term identity blob
+                   we fetched at step 0. Defeats MITM even with a corrupted
+                   pin file. If liboqs.dll is missing we accept based on the
+                   fingerprint pin alone. */
+                if (oqs_sig_available() && !sigHexV2.isEmpty()) {
+                    QByteArray idResp = httpGet("/api/v1/server-identity");
+                    QByteArray pkBlob = QByteArray::fromHex(jsonStr(idResp, "pubkey_blob").toUtf8());
+                    QByteArray sigBlob = QByteArray::fromHex(sigHexV2.toUtf8());
+                    QByteArray msg = QByteArray("GHOSTLINK-KEX-v2|") + sidV2.toUtf8() + "|" + blobBytesQ;
+                    if (!ghostlink_verify_server_sig(
+                            (const BYTE*)pkBlob.constData(), pkBlob.size(),
+                            (const BYTE*)sigBlob.constData(), sigBlob.size(),
+                            (const BYTE*)msg.constData(), msg.size())) {
+                        QMessageBox::critical(this, "Server attestation FAILED",
+                            "The server's PQ handshake signature did not verify.\n"
+                            "Refusing to authenticate — this is a MITM-grade error.");
+                        crypto_free_keypair(&kp);
+                        return;
+                    }
+                }
+
                 BYTE clientBlob[2048]; DWORD cbLen = sizeof(clientBlob);
                 BYTE sessionKey[32];
                 if (crypto_pq_hybrid_client((const BYTE*)blobBytesQ.constData(), blobBytesQ.size(),

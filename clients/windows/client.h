@@ -147,6 +147,16 @@ DWORD  kyber_sk_size(void);
 DWORD  kyber_ct_size(void);
 DWORD  kyber_ss_size(void);
 
+/* ── OQS Signature Verifier (server identity attestation) ─────────── */
+BOOL oqs_sig_available(void);
+BOOL oqs_sig_verify(const char *algorithm,
+                    const BYTE *message, DWORD message_len,
+                    const BYTE *signature, DWORD signature_len,
+                    const BYTE *public_key);
+BOOL ghostlink_verify_server_sig(const BYTE *pk_blob, DWORD pk_blob_len,
+                                  const BYTE *sig_blob, DWORD sig_blob_len,
+                                  const BYTE *message, DWORD message_len);
+
 /* ── TPM 2.0 API ──────────────────────────────────────────────────── */
 BOOL   tpm_detect(void);
 BOOL   tpm_is_available(void);
