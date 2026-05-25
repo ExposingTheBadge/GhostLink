@@ -176,7 +176,7 @@ async def lifespan(ap):
         except asyncio.CancelledError: pass
         print("[GHOSTLINK] Server shutting down")
 
-app = FastAPI(title="GHOSTLINK Secure Messaging", version="1.5.0", lifespan=lifespan)
+app = FastAPI(title="GHOSTLINK Secure Messaging", version="1.6.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -370,9 +370,27 @@ def init_db():
         "ALTER TABLE messages ADD COLUMN expires_at TEXT",
         "ALTER TABLE messages ADD COLUMN envelope_version INTEGER DEFAULT 1",
         "ALTER TABLE messages ADD COLUMN padded_size INTEGER DEFAULT 0",
+        "ALTER TABLE devices ADD COLUMN x25519_pub BLOB",
+        "ALTER TABLE devices ADD COLUMN x25519_pub_sig BLOB",
+        "ALTER TABLE devices ADD COLUMN ratchet_published_at TEXT",
     ):
         try: db.execute(ddl); db.commit()
         except: pass
+    # One-time prekeys (consumed on each new conversation init)
+    try:
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS one_time_prekeys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                prekey_id INTEGER NOT NULL,
+                x25519_pub BLOB NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(device_id, prekey_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_otp_device ON one_time_prekeys(device_id);
+        """)
+        db.commit()
+    except: pass
     try:
         db.execute("CREATE INDEX IF NOT EXISTS idx_msg_expires ON messages(expires_at) WHERE expires_at IS NOT NULL")
         db.commit()
@@ -453,7 +471,7 @@ class AuthRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "fips": "140-2 validated", "version": "1.5.0"}
+    return {"status": "ok", "fips": "140-2 validated", "version": "1.6.0"}
 
 import threading
 ecdh_cache = {}
@@ -499,6 +517,91 @@ async def key_exchange_v2():
         "server_identity_fp": SERVER_IDENTITY["fingerprint"] if SERVER_IDENTITY else "",
         "sig_suite": "Ed25519+ML-DSA-87+SPHINCS+-256s" if SERVER_IDENTITY else "",
     }
+
+@app.post("/api/v1/ratchet/publish-key")
+async def ratchet_publish(request: Request):
+    """Publish this device's long-term X25519 ratchet identity key and a
+    fresh batch of one-time prekeys. Other devices will fetch the bundle
+    via /api/v1/ratchet/bundle/{device_id} to start a ratchet session.
+
+    Body: { device_id, x25519_pub (hex), x25519_pub_sig (hex, ECDSA over
+            the X25519 pub by this device's existing P-384 key — proves
+            ownership), one_time_prekeys: [{prekey_id, pub (hex)}, ...] }
+    """
+    body = await request.json()
+    device_id = body.get("device_id", "")
+    x25519_pub = body.get("x25519_pub", "")
+    x25519_sig = body.get("x25519_pub_sig", "")
+    otps = body.get("one_time_prekeys", [])
+    if not device_id or not x25519_pub:
+        raise HTTPException(400, "Missing required fields")
+    if not db.execute("SELECT id FROM devices WHERE id=?", (device_id,)).fetchone():
+        raise HTTPException(404, "Device not found")
+    try:
+        pub_bytes = bytes.fromhex(x25519_pub)
+        sig_bytes = bytes.fromhex(x25519_sig) if x25519_sig else b""
+        if len(pub_bytes) != 32:
+            raise ValueError("X25519 pub must be 32 bytes")
+    except Exception:
+        raise HTTPException(400, "Invalid x25519_pub or signature")
+    db.execute(
+        "UPDATE devices SET x25519_pub=?, x25519_pub_sig=?, ratchet_published_at=datetime('now') WHERE id=?",
+        (pub_bytes, sig_bytes, device_id),
+    )
+    inserted = 0
+    if isinstance(otps, list):
+        for otp in otps[:200]:  # bound batch size
+            try:
+                pid = int(otp.get("prekey_id"))
+                pub = bytes.fromhex(otp.get("pub", ""))
+                if len(pub) != 32: continue
+                db.execute(
+                    "INSERT OR IGNORE INTO one_time_prekeys (device_id, prekey_id, x25519_pub) VALUES (?,?,?)",
+                    (device_id, pid, pub),
+                )
+                inserted += 1
+            except Exception:
+                continue
+    db.commit()
+    remaining = db.execute(
+        "SELECT COUNT(*) FROM one_time_prekeys WHERE device_id=?", (device_id,)
+    ).fetchone()[0]
+    return {"published": True, "one_time_prekeys_added": inserted, "one_time_prekeys_remaining": remaining}
+
+
+@app.get("/api/v1/ratchet/bundle/{device_id}")
+async def ratchet_bundle(device_id: str):
+    """Return the ratchet bundle for a peer device so a new session can
+    bootstrap: long-term X25519 pub + ownership signature + ONE one-time
+    prekey (atomically consumed). If no one-time prekey is available the
+    bundle still works — initial-message forward secrecy degrades to
+    static-static, but subsequent messages remain fully forward-secret."""
+    row = db.execute(
+        "SELECT x25519_pub, x25519_pub_sig, ratchet_published_at FROM devices WHERE id=?",
+        (device_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        raise HTTPException(404, "Device has not published a ratchet bundle")
+    otp = db.execute(
+        "SELECT id, prekey_id, x25519_pub FROM one_time_prekeys WHERE device_id=? ORDER BY id LIMIT 1",
+        (device_id,),
+    ).fetchone()
+    one_time = None
+    if otp:
+        db.execute("DELETE FROM one_time_prekeys WHERE id=?", (otp[0],))
+        db.commit()
+        one_time = {"prekey_id": otp[1], "pub": otp[2].hex()}
+    return {
+        "device_id": device_id,
+        "x25519_pub": row[0].hex(),
+        "x25519_pub_sig": (row[1] or b"").hex(),
+        "published_at": row[2],
+        "one_time_prekey": one_time,
+        "one_time_prekeys_remaining": db.execute(
+            "SELECT COUNT(*) FROM one_time_prekeys WHERE device_id=?", (device_id,)
+        ).fetchone()[0],
+    }
+
 
 @app.get("/api/v1/server-identity")
 async def server_identity():
@@ -589,24 +692,22 @@ async def get_version():
     embedded version string."""
     base = "https://github.com/ExposingTheBadge/GhostLink/releases/latest"
     return {
-        "version": "1.5.0",
+        "version": "1.6.0",
         "minimum_supported": "1.3.0",
         "release_url": base,
         "windows": f"{base}/download/GHOSTLINK.exe",
         "android": f"{base}/download/GHOSTLINK.apk",
         "linux":   f"{base}/download/ghostlink-linux",
         "changelog": (
-            "1.5.0 — Triple-hybrid server identity signatures (Ed25519 + "
-            "ML-DSA-87 + SPHINCS+-256s) attest every PQ handshake response; "
-            "/api/v1/server-identity exposes the pinning fingerprint. Windows "
-            "client now pins the fingerprint on first connect (TOFU) and "
-            "refuses on mismatch. Onion-only enforcement mode rejects any "
-            "non-.onion request. Reproducible-build skeleton (Dockerfile, "
-            "BUILD-REPRODUCIBILITY.md, signed release manifest script). "
-            "Admin can rotate the server identity. 1.4.0 — PQ hybrid "
-            "(ECDH-P384 + ML-KEM-1024 via HKDF-SHA512), sealed sender, "
-            "disappearing messages, fixed-size padding buckets, big admin "
-            "dashboard expansion."
+            "1.6.0 — Double Ratchet across all three platforms (Python ref + "
+            "Windows BCrypt port + Android JCA port) for forward + future "
+            "secrecy. Server prekey-bundle storage (/api/v1/ratchet/...) for "
+            "X3DH-style session bootstrap. Windows client now does the full "
+            "PQ-hybrid handshake (ECDH-P384 + ML-KEM-1024 via HKDF-SHA512) "
+            "when liboqs.dll is available, falling back to classical. Android "
+            "TOFU-pins the server identity fingerprint. 1.5.0 — Triple-hybrid "
+            "server identity signatures, /api/v1/server-identity, onion-only "
+            "mode, reproducible-build skeleton, identity rotation."
         ),
     }
 
@@ -1731,6 +1832,8 @@ async def admin_stats(session=Depends(require_admin)):
     sealed_pending = db.execute("SELECT COUNT(*) FROM messages WHERE sealed=1 AND delivered=0").fetchone()[0]
     v2_pending = db.execute("SELECT COUNT(*) FROM messages WHERE envelope_version>=2 AND delivered=0").fetchone()[0]
     disappearing_pending = db.execute("SELECT COUNT(*) FROM messages WHERE expires_at IS NOT NULL AND delivered=0").fetchone()[0]
+    ratchet_devices = db.execute("SELECT COUNT(*) FROM devices WHERE x25519_pub IS NOT NULL").fetchone()[0]
+    otp_total = db.execute("SELECT COUNT(*) FROM one_time_prekeys").fetchone()[0]
 
     # ── Hourly activity histogram (last 24h, server-local) ────────
     hourly = db.execute(
@@ -1803,7 +1906,7 @@ async def admin_stats(session=Depends(require_admin)):
         "uptime_sec": round(time.time() - STARTUP_TS, 1),
         "uptime_fmt": _fmt_uptime(time.time() - STARTUP_TS),
         "server_time_utc": datetime.now(tz=timezone.utc).isoformat(timespec='seconds'),
-        "version": "1.5.0",
+        "version": "1.6.0",
         "registration_enabled": registration_enabled,
         "maintenance_mode": maintenance_mode,
         "total_users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
@@ -1825,6 +1928,8 @@ async def admin_stats(session=Depends(require_admin)):
         "identity_fingerprint": SERVER_IDENTITY["fingerprint"] if SERVER_IDENTITY else "",
         "identity_suite": "Ed25519+ML-DSA-87+SPHINCS+-256s" if SERVER_IDENTITY else "",
         "onion_only": setting_get("onion_only", "0") == "1",
+        "ratchet_devices": ratchet_devices,
+        "one_time_prekeys_total": otp_total,
         "os_windows": os_counts.get("windows", 0),
         "os_android": os_counts.get("android", 0),
         "os_ios": os_counts.get("ios", 0),
@@ -2200,6 +2305,8 @@ async function refresh(){
       ['purple',d.sealed_pending,'Sealed Pending'],
       ['purple',d.v2_pending,'v2 Pending'],
       ['warn',d.disappearing_pending,'Disappearing Pending'],
+      ['accent',d.ratchet_devices,'Ratchet Devices'],
+      ['ok',d.one_time_prekeys_total,'One-Time Prekeys'],
     ].map(c=>'<div class="card '+c[0]+'"><div class="val">'+esc(c[1])+'</div><div class="lbl">'+esc(c[2])+'</div></div>').join('');
 
     const hh=d.hourly_activity||[];const hMax=Math.max(1,...hh.map(x=>x.count));

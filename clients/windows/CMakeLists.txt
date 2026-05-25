@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(GHOSTLINK VERSION 1.5.0 LANGUAGES CXX C)
+project(GHOSTLINK VERSION 1.6.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,6 +15,7 @@ set(WIN_MODULES
     storage.c
     tpm.c
     kyber1024.c
+    ratchet.c
 )
 
 add_executable(ghostlink

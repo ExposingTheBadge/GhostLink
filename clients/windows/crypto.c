@@ -2,6 +2,7 @@
  * GHOSTLINK Windows Crypto — FIPS 140-2 via CNG
  */
 #include "client.h"
+#include "ratchet.h"
 
 static BCRYPT_ALG_HANDLE hAesGcm = NULL;
 static BCRYPT_ALG_HANDLE hSha256 = NULL;
@@ -255,4 +256,94 @@ BOOL crypto_decrypt_file_data(const BYTE *key, const BYTE *input, DWORD input_le
     if (!*output) return FALSE;
 
     return crypto_aes_gcm_decrypt(key, nonce, input + 12, ct_len, input + 12 + ct_len, *output);
+}
+
+/* ── PQ Hybrid Client KEX (ECDH-P384 + ML-KEM-1024) ──────────────────
+ * Mirrors crypto/pq_hybrid.py:client_encapsulate. Server blob layout:
+ *   4B 'PKG2' | 4B ec_len(96) | 96B ec_xy | 4B kem_len(1568) | 1568B kem_pk
+ * Client blob layout:
+ *   4B 'PKC2' | 96B ec_xy | 1568B kem_ct  (1668 total)
+ */
+#define MAGIC_SERVER_PUB 0x32474B50UL  /* 'PKG2' LE */
+#define MAGIC_CLIENT_PUB 0x32434B50UL  /* 'PKC2' LE */
+#define PQ_EC_LEN        96
+#define PQ_KEM_PK_LEN    1568
+#define PQ_KEM_CT_LEN    1568
+#define PQ_CLIENT_BLOB   (4 + PQ_EC_LEN + PQ_KEM_CT_LEN)
+
+BOOL crypto_pq_hybrid_client(const BYTE *server_blob, DWORD server_blob_len,
+                             BYTE *client_blob_out, DWORD *client_blob_len_io,
+                             BYTE session_key_out[32]) {
+    if (server_blob_len < 4 + 4 + PQ_EC_LEN + 4 + PQ_KEM_PK_LEN) return FALSE;
+    if (!kyber_available()) return FALSE;
+    if (*client_blob_len_io < PQ_CLIENT_BLOB) { *client_blob_len_io = PQ_CLIENT_BLOB; return FALSE; }
+
+    DWORD magic = *(const DWORD*)server_blob;
+    if (magic != MAGIC_SERVER_PUB) return FALSE;
+    DWORD ec_len = *(const DWORD*)(server_blob + 4);
+    if (ec_len != PQ_EC_LEN) return FALSE;
+    const BYTE *server_ec_xy = server_blob + 8;
+    DWORD kem_len = *(const DWORD*)(server_blob + 8 + PQ_EC_LEN);
+    if (kem_len != PQ_KEM_PK_LEN) return FALSE;
+    const BYTE *server_kem_pk = server_blob + 8 + PQ_EC_LEN + 4;
+
+    /* 1. Generate our ECDH P-384 ephemeral and export uncompressed X||Y. */
+    KeyPair kp = crypto_generate_keypair();
+    if (!kp.handle) return FALSE;
+    /* kp.pub.data = BCRYPT_ECCKEY_BLOB (8B) + X (48) + Y (48) */
+    if (kp.pub.len < 8 + PQ_EC_LEN) { crypto_free_keypair(&kp); return FALSE; }
+    BYTE client_ec_xy[PQ_EC_LEN];
+    memcpy(client_ec_xy, kp.pub.data + 8, PQ_EC_LEN);
+
+    /* 2. Build server's ECC public-key blob and import. */
+    BYTE peer_blob[8 + PQ_EC_LEN];
+    BCRYPT_ECCKEY_BLOB *ph = (BCRYPT_ECCKEY_BLOB*)peer_blob;
+    ph->dwMagic = BCRYPT_ECDH_PUBLIC_P384_MAGIC;
+    ph->cbKey = 48;
+    memcpy(peer_blob + 8, server_ec_xy, PQ_EC_LEN);
+
+    NCRYPT_PROV_HANDLE prov = NULL;
+    if (!BCRYPT_SUCCESS(NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0))) {
+        crypto_free_keypair(&kp); return FALSE;
+    }
+    NCRYPT_KEY_HANDLE peer_key = 0;
+    SECURITY_STATUS s = NCryptImportKey(prov, 0, BCRYPT_ECCPUBLIC_BLOB, NULL, &peer_key,
+                                        peer_blob, sizeof(peer_blob), 0);
+    NCryptFreeObject(prov);
+    if (!BCRYPT_SUCCESS(s)) { crypto_free_keypair(&kp); return FALSE; }
+
+    /* 3. Compute raw ECDH shared (48 bytes). */
+    NCRYPT_SECRET_HANDLE secret = 0;
+    s = NCryptSecretAgreement(kp.handle, peer_key, &secret, 0);
+    NCryptDeleteKey(peer_key, 0);
+    if (!BCRYPT_SUCCESS(s)) { crypto_free_keypair(&kp); return FALSE; }
+    BYTE ec_shared[PQ_EC_LEN] = {0};
+    DWORD ec_shared_len = 0;
+    s = NCryptDeriveKey(secret, L"TRUNCATE", NULL, ec_shared, sizeof(ec_shared), &ec_shared_len, 0);
+    NCryptFreeObject(secret);
+    crypto_free_keypair(&kp);
+    if (!BCRYPT_SUCCESS(s) || ec_shared_len < 48) return FALSE;
+
+    /* 4. Kyber encapsulate against server's KEM pubkey. */
+    BYTE kem_ct[PQ_KEM_CT_LEN]; BYTE kem_shared[32];
+    if (!kyber_encaps(kem_ct, kem_shared, server_kem_pk)) return FALSE;
+
+    /* 5. HKDF-SHA512 over (ec_shared || kem_shared) with 64 zero-byte salt
+          and info = "GHOSTLINK-PQ-HYBRID-v1". 32-byte output. */
+    BYTE ikm[48 + 32];
+    memcpy(ikm, ec_shared, 48);
+    memcpy(ikm + 48, kem_shared, 32);
+    BYTE salt[64] = {0};
+    const BYTE info[] = "GHOSTLINK-PQ-HYBRID-v1";
+    if (!ratchet_hkdf_sha512(salt, 64, ikm, sizeof(ikm), info, sizeof(info) - 1,
+                             session_key_out, 32))
+        return FALSE;
+
+    /* 6. Pack client blob. */
+    BYTE *p = client_blob_out;
+    *(DWORD*)p = MAGIC_CLIENT_PUB; p += 4;
+    memcpy(p, client_ec_xy, PQ_EC_LEN); p += PQ_EC_LEN;
+    memcpy(p, kem_ct, PQ_KEM_CT_LEN);
+    *client_blob_len_io = PQ_CLIENT_BLOB;
+    return TRUE;
 }

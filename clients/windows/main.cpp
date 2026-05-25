@@ -6,7 +6,7 @@
 #include <QtNetwork>
 #include <QtCore>
 
-#define CLIENT_VERSION "1.5.0"
+#define CLIENT_VERSION "1.6.0"
 
 extern "C" {
 #include "client.h"
@@ -485,52 +485,99 @@ private:
         status->setText("Exchanging keys...");
         QApplication::processEvents();
 
-        /* 1. Get server's ephemeral public key */
-        QByteArray keyResp = httpGet("/api/v1/key-exchange");
-        QString sessionId = jsonStr(keyResp, "session_id");
-        QString serverPubBlobHex = jsonStr(keyResp, "server_public_key_blob");
-        if (sessionId.isEmpty() || serverPubBlobHex.isEmpty()) { status->setText("Key exchange failed"); return; }
-
-        /* 2. Generate our ECDH keypair */
+        /* Generate our ECDH keypair — used by both v1 and v2 paths. */
         KeyPair kp = crypto_generate_keypair();
         if (!kp.handle) { status->setText("Key generation FAILED"); return; }
         char *ourPubHex = crypto_hex_encode(kp.pub.data, kp.pub.len);
         QString pubHex = QString::fromUtf8(ourPubHex); free(ourPubHex);
 
-        /* 3. Derive auth key via ECDH */
-        BYTE serverBlob[512]; DWORD blobLen = 0;
-        QByteArray blobHex = serverPubBlobHex.toUtf8();
-        crypto_hex_decode(blobHex.constData(), serverBlob, &blobLen);
-        BYTE authKey[32];
-        if (!crypto_auth_derive_key(kp.handle, serverBlob, blobLen, authKey)) { status->setText("Key derivation failed"); return; }
+        QByteArray resp;
+        bool usedPq = false;
 
-        /* 4. Build + encrypt auth payload (server JSON-parses after decrypt;
-              any " or \ in password would break the parse if hand-rolled). */
-        char appId[64]; app_instance_id(appId, 64);
-        QByteArray payload = jsonBody({
-            {"username", u}, {"password", p}, {"device_name", d},
-            {"platform", QString("windows")}, {"register", showRegister},
-            {"public_key", pubHex}
-        });
+        /* ── v2 hybrid PQ handshake (ECDH-P384 + ML-KEM-1024) ───────────
+              Opportunistic: if liboqs.dll is present we use it. The server
+              attests the handshake with its triple-hybrid signature; the
+              fingerprint was already pinned at step 0 above. */
+        if (kyber_available()) {
+            QByteArray kxV2 = httpGet("/api/v1/key-exchange-v2");
+            QString sidV2 = jsonStr(kxV2, "session_id");
+            QString blobHexV2 = jsonStr(kxV2, "server_public_key_blob");
+            if (!sidV2.isEmpty() && !blobHexV2.isEmpty()) {
+                QByteArray blobBytesQ = QByteArray::fromHex(blobHexV2.toUtf8());
+                BYTE clientBlob[2048]; DWORD cbLen = sizeof(clientBlob);
+                BYTE sessionKey[32];
+                if (crypto_pq_hybrid_client((const BYTE*)blobBytesQ.constData(), blobBytesQ.size(),
+                                            clientBlob, &cbLen, sessionKey)) {
+                    /* Auth key = SHA-256(session_key || "GHOSTLINK-AUTH-PQ-v1") */
+                    BYTE authKey[32]; BYTE buf[32 + 21];
+                    memcpy(buf, sessionKey, 32);
+                    memcpy(buf + 32, "GHOSTLINK-AUTH-PQ-v1", 21);
+                    crypto_sha256(buf, sizeof(buf), authKey);
 
-        BYTE nonce[12], ct[4096], tag[16];
-        crypto_random_bytes(nonce, 12);
-        crypto_aes_gcm_encrypt(authKey, (const BYTE*)payload.constData(), payload.size(), nonce, ct, tag);
+                    QByteArray payload = jsonBody({
+                        {"username", u}, {"password", p}, {"device_name", d},
+                        {"platform", QString("windows")}, {"register", showRegister},
+                        {"public_key", pubHex}
+                    });
+                    BYTE nonce[12], ct[4096], tag[16];
+                    crypto_random_bytes(nonce, 12);
+                    crypto_aes_gcm_encrypt(authKey, (const BYTE*)payload.constData(),
+                                           payload.size(), nonce, ct, tag);
+                    char *nh = crypto_hex_encode(nonce, 12);
+                    char *ch = crypto_hex_encode(ct, payload.size());
+                    char *th = crypto_hex_encode(tag, 16);
+                    char *bh = crypto_hex_encode(clientBlob, cbLen);
+                    QByteArray body = jsonBody({
+                        {"session_id", sidV2},
+                        {"client_pubkey_blob", QString::fromUtf8(bh)},
+                        {"nonce", QString::fromUtf8(nh)},
+                        {"ciphertext", QString::fromUtf8(ch)},
+                        {"tag", QString::fromUtf8(th)},
+                    });
+                    free(nh); free(ch); free(th); free(bh);
+                    resp = httpPost("/api/v1/auth-v2", body);
+                    QString didV2 = jsonStr(resp, "device_id");
+                    if (!didV2.isEmpty()) usedPq = true;
+                }
+            }
+        }
 
-        char *nonceHex = crypto_hex_encode(nonce, 12);
-        char *ctHex = crypto_hex_encode(ct, payload.size());
-        char *tagHex = crypto_hex_encode(tag, 16);
-
-        /* 5. Send encrypted auth */
-        QByteArray authBody = jsonBody({
-            {"session_id", sessionId}, {"client_public_key", pubHex},
-            {"nonce", QString::fromUtf8(nonceHex)},
-            {"ciphertext", QString::fromUtf8(ctHex)},
-            {"tag", QString::fromUtf8(tagHex)}
-        });
-        free(nonceHex); free(ctHex); free(tagHex);
-
-        QByteArray resp = httpPost("/api/v1/auth", authBody);
+        /* ── v1 classical fallback ─────────────────────────────────── */
+        if (!usedPq) {
+            QByteArray keyResp = httpGet("/api/v1/key-exchange");
+            QString sessionId = jsonStr(keyResp, "session_id");
+            QString serverPubBlobHex = jsonStr(keyResp, "server_public_key_blob");
+            if (sessionId.isEmpty() || serverPubBlobHex.isEmpty()) {
+                status->setText("Key exchange failed"); crypto_free_keypair(&kp); return;
+            }
+            BYTE serverBlob[512]; DWORD blobLen = 0;
+            QByteArray blobHex = serverPubBlobHex.toUtf8();
+            crypto_hex_decode(blobHex.constData(), serverBlob, &blobLen);
+            BYTE authKey[32];
+            if (!crypto_auth_derive_key(kp.handle, serverBlob, blobLen, authKey)) {
+                status->setText("Key derivation failed"); crypto_free_keypair(&kp); return;
+            }
+            QByteArray payload = jsonBody({
+                {"username", u}, {"password", p}, {"device_name", d},
+                {"platform", QString("windows")}, {"register", showRegister},
+                {"public_key", pubHex}
+            });
+            BYTE nonce[12], ct[4096], tag[16];
+            crypto_random_bytes(nonce, 12);
+            crypto_aes_gcm_encrypt(authKey, (const BYTE*)payload.constData(),
+                                   payload.size(), nonce, ct, tag);
+            char *nonceHex = crypto_hex_encode(nonce, 12);
+            char *ctHex = crypto_hex_encode(ct, payload.size());
+            char *tagHex = crypto_hex_encode(tag, 16);
+            QByteArray authBody = jsonBody({
+                {"session_id", sessionId}, {"client_public_key", pubHex},
+                {"nonce", QString::fromUtf8(nonceHex)},
+                {"ciphertext", QString::fromUtf8(ctHex)},
+                {"tag", QString::fromUtf8(tagHex)}
+            });
+            free(nonceHex); free(ctHex); free(tagHex);
+            resp = httpPost("/api/v1/auth", authBody);
+        }
         QString did = jsonStr(resp, "device_id");
         if (!did.isEmpty()) {
             m_deviceId = did; m_username = u; m_deviceName = d; m_platform = "windows"; m_password = p;

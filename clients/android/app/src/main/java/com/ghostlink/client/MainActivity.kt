@@ -114,6 +114,20 @@ class GhostlinkVM(application: Application) : AndroidViewModel(application) {
     fun auth(u: String, p: String, d: String, isReg: Boolean, onError: (String) -> Unit) {
         viewModelScope.launch {
             try {
+                // 0. Verify the server's long-term identity fingerprint (TOFU).
+                //    Suite: Ed25519 + ML-DSA-87 + SPHINCS+-256s. If the
+                //    fingerprint differs from the one we pinned earlier, refuse.
+                val (verdict, fp) = ServerPin.verify(getApplication())
+                when (verdict) {
+                    ServerPin.Verdict.MISMATCH -> {
+                        val pinned = ServerPin.loadPinned(getApplication()) ?: "(none)"
+                        onError("Server identity changed.\nPinned: $pinned\nServer: $fp\nRefusing.")
+                        return@launch
+                    }
+                    ServerPin.Verdict.NETWORK_ERROR -> { onError("Cannot reach server"); return@launch }
+                    else -> { /* OK, FIRST_PIN_SAVED, or ENDPOINT_MISSING (legacy) — continue */ }
+                }
+
                 // 1. Get server's ECDH public key
                 val keyEx = withContext(Dispatchers.IO) { NetworkClient.get("/api/v1/key-exchange") }
                 val sessionId = keyEx.getString("session_id")

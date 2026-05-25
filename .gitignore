@@ -63,3 +63,6 @@ GHOSTLINK_Explained.html
 
 .claude/
 admin_js_check.js
+chat-transcript.jsonl
+chat-transcript.txt
+dump_chat.py

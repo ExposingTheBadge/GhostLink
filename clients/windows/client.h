@@ -89,6 +89,16 @@ char*  crypto_hex_encode(const BYTE *data, DWORD len);
 BOOL   crypto_hex_decode(const char *hex, BYTE *data, DWORD *len);
 BOOL   crypto_auth_derive_key(NCRYPT_KEY_HANDLE my_priv, const BYTE *peer_blob, DWORD blob_len, BYTE key_out[32]);
 
+/* Post-quantum hybrid client KEX.
+ *   server_blob:        the server_public_key_blob bytes from /api/v1/key-exchange-v2
+ *                       (4B magic 'PKG2' + 4B ec_len(96) + 96B ec_xy + 4B kem_len(1568) + 1568B kem_pk)
+ *   client_blob_out:    receives 4B 'PKC2' + 96B ec_xy + 1568B kem_ct = 1668 bytes
+ *   client_blob_len:    in: capacity, out: written
+ *   session_key_out:    32-byte HKDF-SHA512(ECDH_shared || KEM_shared, "GHOSTLINK-PQ-HYBRID-v1") */
+BOOL   crypto_pq_hybrid_client(const BYTE *server_blob, DWORD server_blob_len,
+                               BYTE *client_blob_out, DWORD *client_blob_len_io,
+                               BYTE session_key_out[32]);
+
 /* ── Network API ──────────────────────────────────────────────────── */
 BOOL   network_init(void);
 void   network_cleanup(void);
