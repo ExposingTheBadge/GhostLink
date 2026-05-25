@@ -3,10 +3,16 @@ GHOSTLINK Secure Messaging Server — FIPS 140-2 Compliant
 Port 58443 | TLS 1.3 | E2E Encryption | Device Registration
 """
 
-import os, sys, json, time, sqlite3, uuid, struct, hashlib
+import os, sys, json, time, sqlite3, uuid, struct, hashlib, collections, shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+STARTUP_TS = time.time()
+REQ_COUNTS = collections.Counter()
+REQ_LATENCY = collections.deque(maxlen=2000)  # (path, ms, ts)
+ERR_COUNTS = collections.Counter()
+RECENT_ERRORS = collections.deque(maxlen=100)
 
 # Add parent to path for crypto imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,6 +35,14 @@ except ImportError:
     import fips_crypto as crypto
     from fips_crypto import *
 
+try:
+    from crypto import pq_hybrid
+    PQ_AVAILABLE = pq_hybrid.self_test()
+except Exception as _pq_e:
+    pq_hybrid = None
+    PQ_AVAILABLE = False
+    print(f"[GHOSTLINK] PQ hybrid unavailable: {_pq_e}")
+
 from cryptography.hazmat.primitives.asymmetric import ec
 
 # ── Config ───────────────────────────────────────────────────────────
@@ -40,14 +54,40 @@ os.makedirs(FILE_DIR, exist_ok=True)
 SESSION_TIMEOUT = 3600  # 1 hour
 MAX_DEVICES_PER_USER = 25
 
+async def _expiry_sweeper():
+    """Periodically purge expired messages and files."""
+    while True:
+        try:
+            # Disappearing messages
+            n_msg = db.execute("SELECT COUNT(*) FROM messages WHERE expires_at IS NOT NULL AND expires_at < datetime('now')").fetchone()[0]
+            if n_msg:
+                db.execute("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < datetime('now')")
+            # Expired files
+            file_rows = db.execute(
+                "SELECT id, storage_name FROM file_transfers WHERE expires_at IS NOT NULL AND expires_at < datetime('now')"
+            ).fetchall()
+            for fid, name in file_rows:
+                path = os.path.join(FILE_DIR, name)
+                if os.path.isfile(path):
+                    try: os.remove(path)
+                    except OSError: pass
+                db.execute("DELETE FROM file_transfers WHERE id=?", (fid,))
+            db.commit()
+            if n_msg or file_rows:
+                print(f"[GHOSTLINK] expiry sweep: removed {n_msg} msgs, {len(file_rows)} files")
+        except Exception as e:
+            print(f"[GHOSTLINK] expiry sweep error: {e}")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(ap):
     # Startup
     if not fips_self_test():
         raise RuntimeError("FIPS 140-2 self-test FAILED — server cannot start")
     print(f"[GHOSTLINK] FIPS 140-2 self-test: PASSED")
+    print(f"[GHOSTLINK] PQ hybrid (ECDH-P384 + ML-KEM-1024): {'READY' if PQ_AVAILABLE else 'unavailable'}")
     print(f"[GHOSTLINK] Server starting on port {PORT}")
-    # Cleanup expired files on startup
     expired = db.execute(
         "SELECT id, storage_name FROM file_transfers WHERE expires_at < datetime('now') OR downloaded=1"
     ).fetchall()
@@ -59,11 +99,16 @@ async def lifespan(ap):
     db.commit()
     if expired:
         print(f"[GHOSTLINK] Cleaned up {len(expired)} expired/downloaded files")
-    yield
-    # Shutdown
-    print("[GHOSTLINK] Server shutting down")
+    sweep_task = asyncio.create_task(_expiry_sweeper())
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        try: await sweep_task
+        except asyncio.CancelledError: pass
+        print("[GHOSTLINK] Server shutting down")
 
-app = FastAPI(title="GHOSTLINK Secure Messaging", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="GHOSTLINK Secure Messaging", version="1.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,6 +267,22 @@ def init_db():
             response_reason TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_ginv_to ON group_invites(to_user_id, status);
+
+        CREATE TABLE IF NOT EXISTS server_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            ts TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
     """)
     # Migration: add expires_at if missing
     try:
@@ -235,8 +296,37 @@ def init_db():
         db.commit()
     except:
         pass
+    # Migration: sealed sender + disappearing messages + envelope version
+    for ddl in (
+        "ALTER TABLE messages ADD COLUMN sealed INTEGER DEFAULT 0",
+        "ALTER TABLE messages ADD COLUMN expires_at TEXT",
+        "ALTER TABLE messages ADD COLUMN envelope_version INTEGER DEFAULT 1",
+        "ALTER TABLE messages ADD COLUMN padded_size INTEGER DEFAULT 0",
+    ):
+        try: db.execute(ddl); db.commit()
+        except: pass
+    try:
+        db.execute("CREATE INDEX IF NOT EXISTS idx_msg_expires ON messages(expires_at) WHERE expires_at IS NOT NULL")
+        db.commit()
+    except:
+        pass
     db.commit()
     return db
+
+
+# ── Envelope versioning and padding ──────────────────────────────────
+# Fixed-size buckets close out length-based traffic analysis. Every v2
+# envelope must round-trip to one of these sizes BEFORE the b64/hex hop.
+PAD_BUCKETS = (4096, 65536, 1048576, 16777216)  # 4K, 64K, 1M, 16M
+
+def pad_bucket_for(plain_len: int) -> int:
+    for b in PAD_BUCKETS:
+        if plain_len <= b:
+            return b
+    return ((plain_len + 16777215) // 16777216) * 16777216
+
+def is_valid_padded_size(n: int) -> bool:
+    return n in PAD_BUCKETS or (n > PAD_BUCKETS[-1] and n % PAD_BUCKETS[-1] == 0)
 
 db = init_db()
 
@@ -295,11 +385,13 @@ class AuthRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "fips": "140-2 validated", "version": "1.3.0"}
+    return {"status": "ok", "fips": "140-2 validated", "version": "1.4.0"}
 
 import threading
 ecdh_cache = {}
 ecdh_lock = threading.Lock()
+pq_cache = {}          # session_id -> {ec_priv, kem_sk, ts}
+pq_lock = threading.Lock()
 
 @app.get("/api/v1/key-exchange")
 async def key_exchange():
@@ -315,22 +407,114 @@ async def key_exchange():
             for k in list(ecdh_cache.keys())[:100]: del ecdh_cache[k]
     return {"session_id": sid, "server_public_key": pub_hex, "server_public_key_blob": blob.hex()}
 
+@app.get("/api/v1/key-exchange-v2")
+async def key_exchange_v2():
+    """Post-quantum hybrid key exchange: ECDH P-384 + ML-KEM-1024.
+    Defeats Harvest-Now-Decrypt-Later — adversary must break both lattices
+    AND elliptic curves to recover the session key."""
+    if not PQ_AVAILABLE:
+        raise HTTPException(503, "PQ hybrid unavailable")
+    state, blob = pq_hybrid.gen_server_keypair()
+    sid = uuid.uuid4().hex
+    with pq_lock:
+        pq_cache[sid] = {**state, "ts": time.time()}
+        # Evict oldest if cache grows
+        if len(pq_cache) > 200:
+            for k in sorted(pq_cache, key=lambda k: pq_cache[k]["ts"])[:100]:
+                del pq_cache[k]
+    return {
+        "session_id": sid,
+        "server_public_key_blob": blob.hex(),
+        "suite": "ECDH-P384+ML-KEM-1024",
+        "kdf": "HKDF-SHA512",
+    }
+
+@app.post("/api/v1/auth-v2")
+async def encrypted_auth_v2(request: Request):
+    """Encrypted registration/login over post-quantum hybrid handshake.
+    Body: { session_id, client_pubkey_blob, nonce, ciphertext, tag }"""
+    if not PQ_AVAILABLE:
+        raise HTTPException(503, "PQ hybrid unavailable")
+    body = await request.json()
+    sid = body.get("session_id", "")
+    with pq_lock:
+        state = pq_cache.pop(sid, None)
+    if not state:
+        raise HTTPException(401, "Invalid or expired session")
+    try:
+        client_blob = bytes.fromhex(body.get("client_pubkey_blob", ""))
+        shared = pq_hybrid.server_decapsulate(state, client_blob)
+        key = hashlib.sha256(shared + b"GHOSTLINK-AUTH-PQ-v1").digest()[:32]
+        nonce = bytes.fromhex(body.get("nonce", ""))
+        ct = bytes.fromhex(body.get("ciphertext", ""))
+        tag = bytes.fromhex(body.get("tag", ""))
+        plain = decrypt_aes_gcm(key, nonce, ct + tag)
+        payload = json.loads(plain.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "Decryption failed")
+
+    username = payload.get("username", "")
+    password = payload.get("password", "")
+    device_name = payload.get("device_name", "")
+    platform = payload.get("platform", "")
+    is_register = payload.get("register", False)
+    pub_key_hex = payload.get("public_key", "")
+
+    if is_register:
+        if setting_get("registration_enabled", "1") != "1":
+            raise HTTPException(403, "Registration is currently disabled")
+        if db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone():
+            raise HTTPException(409, "Username already registered")
+        user_id = uuid.uuid4().hex
+        key, salt = derive_key(password)
+        db.execute("INSERT INTO users (id, username, password_hash, password_salt) VALUES (?,?,?,?)",
+                   (user_id, username, key.hex(), salt))
+        db.commit()
+    else:
+        user = db.execute("SELECT id, password_hash, password_salt FROM users WHERE username=?",
+                          (username,)).fetchone()
+        if not user: raise HTTPException(401, "Invalid credentials")
+        derived, _ = derive_key(password, user[2])
+        if derived.hex() != user[1]: raise HTTPException(401, "Invalid credentials")
+
+    user = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+    count = db.execute("SELECT COUNT(*) FROM devices WHERE user_id=?", (user[0],)).fetchone()[0]
+    if count >= MAX_DEVICES_PER_USER and not is_register:
+        raise HTTPException(400, f"Maximum {MAX_DEVICES_PER_USER} devices per user")
+    if platform not in ('windows','ios','android'):
+        raise HTTPException(400, "Invalid platform")
+    try:
+        pub_key_bytes = bytes.fromhex(pub_key_hex)
+        deserialize_public_key(pub_key_bytes)
+    except Exception:
+        raise HTTPException(400, "Invalid public key format")
+
+    device_id = generate_device_id()
+    db.execute("INSERT INTO devices (id, user_id, device_name, platform, public_key, hwid) VALUES (?,?,?,?,?,?)",
+               (device_id, user[0], device_name, platform, pub_key_bytes, ""))
+    db.commit()
+    return {"device_id": device_id, "user_id": user[0], "registered": True, "suite": "PQ-HYBRID-v1"}
+
 @app.get("/api/v1/version")
 async def get_version():
     """Client update check endpoint. Clients fetch this and compare to their
     embedded version string."""
     base = "https://github.com/ExposingTheBadge/GhostLink/releases/latest"
     return {
-        "version": "1.3.0",
+        "version": "1.4.0",
         "minimum_supported": "1.3.0",
         "release_url": base,
         "windows": f"{base}/download/GHOSTLINK.exe",
         "android": f"{base}/download/GHOSTLINK.apk",
         "linux":   f"{base}/download/ghostlink-linux",
         "changelog": (
-            "1.3.0 — Inline image attachments in chat with click-to-fullscreen "
-            "viewer; sender or recipient can permanently delete images from "
-            "the server. Cross-device image decryption via /devices/{id}/pubkey."
+            "1.4.0 — Post-quantum hybrid key exchange (ECDH-P384 + ML-KEM-1024 "
+            "cascaded through HKDF-SHA512) closes Harvest-Now-Decrypt-Later. "
+            "Sealed-sender relay (server never sees sender). Disappearing messages "
+            "(X-Expires-In) with periodic server-side purge. Envelope versioning "
+            "and fixed-size padding buckets (4K/64K/1M/16M) to defeat traffic "
+            "analysis. Massive admin dashboard expansion with audit log, "
+            "controls, hourly histogram, top endpoints, failed-login feed."
         ),
     }
 
@@ -390,6 +574,8 @@ async def encrypted_auth(request: Request):
 
     # Register user if new account
     if is_register:
+        if setting_get("registration_enabled", "1") != "1":
+            raise HTTPException(403, "Registration is currently disabled")
         existing = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
         if existing:
             raise HTTPException(409, "Username already registered")
@@ -528,47 +714,121 @@ async def register_device(req: RegisterDeviceRequest):
 
 # ── Send Message ─────────────────────────────────────────────────────
 @app.post("/api/v1/messages/send")
-async def send_message(req: SendMessageRequest):
-    """Relay an encrypted message. Server never sees plaintext."""
-    # Validate both devices exist
-    sender = db.execute("SELECT id FROM devices WHERE id = ?", (req.sender_device_id,)).fetchone()
-    recipient = db.execute("SELECT id FROM devices WHERE id = ?", (req.recipient_device_id,)).fetchone()
+async def send_message(request: Request):
+    """Relay an encrypted message. Server never sees plaintext.
+
+    Optional headers:
+      X-Expires-In: <seconds>   Disappearing-message TTL (server purges at expiry).
+      X-Envelope-Version: 2     Marks v2 envelopes (size MUST hit a padding bucket).
+    Body is the SendMessageRequest (sender_device_id, recipient_device_id, envelope).
+    """
+    body = await request.json()
+    sender_id = body.get("sender_device_id", "")
+    recipient_id = body.get("recipient_device_id", "")
+    envelope_str = body.get("envelope", "")
+    expires_in = request.headers.get("X-Expires-In", "")
+    env_ver_hdr = request.headers.get("X-Envelope-Version", "1")
+
+    sender = db.execute("SELECT id FROM devices WHERE id=?", (sender_id,)).fetchone()
+    recipient = db.execute("SELECT id FROM devices WHERE id=?", (recipient_id,)).fetchone()
     if not sender or not recipient:
         raise HTTPException(404, "Device not found")
 
-    # Validate envelope is valid JSON
     try:
-        envelope = json.loads(req.envelope)
-        assert "nonce" in envelope
-        assert "ciphertext" in envelope
-        assert "sig" in envelope
-        assert "sender" in envelope
-        assert "ts" in envelope
+        envelope = json.loads(envelope_str)
+        for k in ("nonce", "ciphertext", "sig", "sender", "ts"):
+            assert k in envelope
     except Exception:
         raise HTTPException(400, "Invalid message envelope format")
 
-    # Store encrypted blob
+    env_ver = int(envelope.get("v", env_ver_hdr) or 1)
+    padded_size = 0
+    if env_ver >= 2:
+        try:
+            ct_bytes = bytes.fromhex(envelope["ciphertext"])
+            padded_size = len(ct_bytes)
+        except Exception:
+            raise HTTPException(400, "v2 ciphertext must be hex")
+        if not is_valid_padded_size(padded_size):
+            raise HTTPException(400, f"v2 envelope must be padded to one of {PAD_BUCKETS}")
+
+    expires_at = None
+    if expires_in:
+        try:
+            secs = max(1, min(int(expires_in), 30 * 86400))
+            expires_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=secs)).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
     msg_id = uuid.uuid4().hex
     db.execute(
-        "INSERT INTO messages (id, sender_device_id, recipient_device_id, envelope) VALUES (?, ?, ?, ?)",
-        (msg_id, req.sender_device_id, req.recipient_device_id, json.dumps(envelope))
+        "INSERT INTO messages (id, sender_device_id, recipient_device_id, envelope, "
+        "sealed, envelope_version, padded_size, expires_at) VALUES (?,?,?,?,0,?,?,?)",
+        (msg_id, sender_id, recipient_id, json.dumps(envelope), env_ver, padded_size, expires_at),
     )
-
-    # Update last_seen
-    db.execute("UPDATE devices SET last_seen = datetime('now') WHERE id = ?", (req.sender_device_id,))
+    db.execute("UPDATE devices SET last_seen=datetime('now') WHERE id=?", (sender_id,))
     db.commit()
+    return {"message_id": msg_id, "relayed": True, "v": env_ver, "expires_at": expires_at}
 
-    return {"message_id": msg_id, "relayed": True}
+
+@app.post("/api/v1/messages/send-sealed")
+async def send_sealed_message(request: Request):
+    """Sealed-sender relay: the server learns the recipient and a ciphertext blob.
+    The sender's identity is inside the encrypted envelope.
+
+    Headers:
+      X-Recipient-ID: <device_id>      required
+      X-Expires-In: <seconds>          optional disappearing-message TTL
+      X-Envelope-Version: 2            optional (v2 envelopes must be padded)
+    Body: raw bytes of the sealed envelope (any format the clients agree on).
+    """
+    recipient_id = request.headers.get("X-Recipient-ID", "")
+    expires_in = request.headers.get("X-Expires-In", "")
+    env_ver = int(request.headers.get("X-Envelope-Version", "2") or 2)
+
+    if not recipient_id:
+        raise HTTPException(400, "Missing X-Recipient-ID")
+    if not db.execute("SELECT id FROM devices WHERE id=?", (recipient_id,)).fetchone():
+        raise HTTPException(404, "Recipient device not found")
+
+    sealed_blob = await request.body()
+    if not sealed_blob:
+        raise HTTPException(400, "Empty payload")
+
+    padded_size = len(sealed_blob)
+    if env_ver >= 2 and not is_valid_padded_size(padded_size):
+        raise HTTPException(400, f"Sealed v2 envelope must hit a padding bucket {PAD_BUCKETS}")
+
+    expires_at = None
+    if expires_in:
+        try:
+            secs = max(1, min(int(expires_in), 30 * 86400))
+            expires_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=secs)).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
+    msg_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO messages (id, sender_device_id, recipient_device_id, envelope, "
+        "sealed, envelope_version, padded_size, expires_at) VALUES (?,?,?,?,1,?,?,?)",
+        (msg_id, recipient_id, recipient_id, sealed_blob.hex(), env_ver, padded_size, expires_at),
+    )
+    db.commit()
+    return {"message_id": msg_id, "sealed": True, "v": env_ver, "expires_at": expires_at}
 
 # ── Fetch Messages ───────────────────────────────────────────────────
 @app.post("/api/v1/messages/fetch")
 async def fetch_messages(req: GetMessagesRequest):
-    """Fetch undelivered messages for a device."""
+    """Fetch undelivered messages for a device.
+
+    Sealed messages (sealed=1) carry their envelope as a raw hex blob rather
+    than parsed JSON — the sender's identity lives inside that blob."""
     device = db.execute("SELECT id FROM devices WHERE id = ?", (req.device_id,)).fetchone()
     if not device:
         raise HTTPException(404, "Device not found")
 
-    query = "SELECT id, sender_device_id, envelope, server_ts FROM messages WHERE recipient_device_id = ? AND delivered = 0"
+    query = ("SELECT id, sender_device_id, envelope, server_ts, sealed, envelope_version, expires_at "
+             "FROM messages WHERE recipient_device_id = ? AND delivered = 0")
     params = [req.device_id]
     if req.since:
         query += " AND server_ts > ?"
@@ -576,27 +836,34 @@ async def fetch_messages(req: GetMessagesRequest):
 
     messages = db.execute(query + " ORDER BY server_ts ASC LIMIT 100", params).fetchall()
 
-    # Log latency before destroying messages
     now = datetime.now(tz=timezone.utc)
     for msg in messages:
-        stored = datetime.fromisoformat(msg[3])
-        latency_ms = (now - stored.replace(tzinfo=timezone.utc)).total_seconds() * 1000
-        db.execute("INSERT INTO message_latency (message_id, latency_ms) VALUES (?,?)", (msg[0], latency_ms))
+        try:
+            stored = datetime.fromisoformat(msg[3])
+            latency_ms = (now - stored.replace(tzinfo=timezone.utc)).total_seconds() * 1000
+            db.execute("INSERT INTO message_latency (message_id, latency_ms) VALUES (?,?)", (msg[0], latency_ms))
+        except Exception:
+            pass
         db.execute("DELETE FROM messages WHERE id = ?", (msg[0],))
     db.execute("UPDATE devices SET last_seen = datetime('now') WHERE id = ?", (req.device_id,))
     db.commit()
 
-    return {
-        "messages": [
-            {
-                "id": m[0],
-                "sender_device_id": m[1],
-                "envelope": json.loads(m[2]),
-                "server_ts": m[3]
-            }
-            for m in messages
-        ]
-    }
+    out = []
+    for m in messages:
+        sealed = bool(m[4] or 0)
+        ver = m[5] or 1
+        item = {"id": m[0], "server_ts": m[3], "v": ver, "sealed": sealed, "expires_at": m[6]}
+        if sealed:
+            item["sealed_envelope"] = m[2]
+            item["sender_device_id"] = None
+        else:
+            item["sender_device_id"] = m[1]
+            try:
+                item["envelope"] = json.loads(m[2])
+            except Exception:
+                item["envelope"] = m[2]
+        out.append(item)
+    return {"messages": out}
 
 # ── Contact Discovery ────────────────────────────────────────────────
 class ContactSearchRequest(BaseModel):
@@ -846,22 +1113,29 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
 
     try:
         while True:
-            # Poll for new messages every 2 seconds
             messages = db.execute(
-                "SELECT id, sender_device_id, envelope, server_ts FROM messages WHERE recipient_device_id = ? AND delivered = 0 ORDER BY server_ts ASC LIMIT 50",
+                "SELECT id, sender_device_id, envelope, server_ts, sealed, envelope_version, expires_at "
+                "FROM messages WHERE recipient_device_id = ? AND delivered = 0 "
+                "ORDER BY server_ts ASC LIMIT 50",
                 (device_id,)
             ).fetchall()
 
             for msg in messages:
-                await websocket.send_json({
-                    "id": msg[0],
-                    "sender_device_id": msg[1],
-                    "envelope": json.loads(msg[2]),
-                    "server_ts": msg[3]
-                })
+                sealed = bool(msg[4] or 0)
+                ver = msg[5] or 1
+                payload = {"id": msg[0], "server_ts": msg[3], "v": ver, "sealed": sealed, "expires_at": msg[6]}
+                if sealed:
+                    payload["sealed_envelope"] = msg[2]
+                    payload["sender_device_id"] = None
+                else:
+                    payload["sender_device_id"] = msg[1]
+                    try:
+                        payload["envelope"] = json.loads(msg[2])
+                    except Exception:
+                        payload["envelope"] = msg[2]
+                await websocket.send_json(payload)
                 db.execute("UPDATE messages SET delivered = 1 WHERE id = ?", (msg[0],))
             db.commit()
-
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         pass
@@ -1053,6 +1327,62 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 app.add_middleware(RateLimitMiddleware)
+
+# Telemetry middleware — pure in-memory counters for the admin dashboard.
+# Tracks endpoint hit counts, latency, and errors. No PII recorded.
+class TelemetryMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        t0 = time.perf_counter()
+        path = request.url.path
+        REQ_COUNTS[path] += 1
+        try:
+            response = await call_next(request)
+        except HTTPException as he:
+            ERR_COUNTS[path] += 1
+            RECENT_ERRORS.appendleft({
+                "ts": datetime.now(tz=timezone.utc).isoformat(timespec='seconds'),
+                "path": path, "status": he.status_code, "detail": str(he.detail)[:200]
+            })
+            raise
+        except Exception as e:
+            ERR_COUNTS[path] += 1
+            RECENT_ERRORS.appendleft({
+                "ts": datetime.now(tz=timezone.utc).isoformat(timespec='seconds'),
+                "path": path, "status": 500, "detail": type(e).__name__
+            })
+            raise
+        ms = (time.perf_counter() - t0) * 1000.0
+        REQ_LATENCY.append((path, ms, time.time()))
+        if response.status_code >= 400:
+            ERR_COUNTS[path] += 1
+            RECENT_ERRORS.appendleft({
+                "ts": datetime.now(tz=timezone.utc).isoformat(timespec='seconds'),
+                "path": path, "status": response.status_code, "detail": ""
+            })
+        return response
+
+app.add_middleware(TelemetryMiddleware)
+
+# ── Server settings (toggles) ────────────────────────────────────────
+def setting_get(key: str, default: str = "") -> str:
+    row = db.execute("SELECT value FROM server_settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+def setting_set(key: str, value: str):
+    db.execute(
+        "INSERT INTO server_settings (key,value,updated_at) VALUES (?,?,datetime('now')) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+        (key, value)
+    )
+    db.commit()
+
+def audit_admin(actor: str, action: str, target: str = "", detail: str = ""):
+    try:
+        db.execute("INSERT INTO audit_log (actor,action,target,detail) VALUES (?,?,?,?)",
+                   (actor[:64], action[:64], target[:128], detail[:500]))
+        db.commit()
+    except Exception:
+        pass
 
 def get_client_info(request: Request) -> tuple:
     ip = request.client.host if request.client else "unknown"
@@ -1254,91 +1584,134 @@ async def admin_logout(session=Depends(get_admin_session)):
     return resp
 
 # ── Admin Dashboard ──────────────────────────────────────────────────
-@app.get("/admin")
-async def admin_dashboard(session=Depends(require_admin)):
-    """Admin dashboard HTML."""
-    return HTMLResponse("""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GHOSTLINK Admin</title>
-<style>:root{--bg:#0a0e17;--bg2:#111827;--border:#1a2535;--text:#c8d6e5;--dim:#6e7a8a;--accent:#00d4ff;--ok:#2ed573;--warn:#ffc048;--danger:#ff4757}
-*,*::before,*::after{box-sizing:border-box}body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:13px;margin:0;padding:0}
-.top{background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 20px;display:flex;align-items:center;gap:16px}
-.top h1{font-size:18px;margin:0;color:var(--accent);letter-spacing:1px}
-.top .spacer{flex:1}
-.top button{background:transparent;border:1px solid var(--border);color:var(--dim);padding:6px 14px;border-radius:4px;cursor:pointer;font-size:11px}
-.top button:hover{color:var(--danger);border-color:var(--danger)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;padding:20px}
-.card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px}
-.card .val{font-size:32px;font-weight:700}
-.card .lbl{font-size:11px;color:var(--dim);text-transform:uppercase;margin-top:4px;letter-spacing:.5px}
-.card.accent .val{color:var(--accent)}.card.ok .val{color:var(--ok)}.card.warn .val{color:var(--warn)}.card.danger .val{color:var(--danger)}
-.panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;margin:0 20px 20px;overflow:hidden}
-.panel-hdr{padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;color:var(--accent);letter-spacing:.5px}
-table{width:100%;border-collapse:collapse;font-size:11px}
-th{text-align:left;padding:8px 12px;color:var(--dim);text-transform:uppercase;font-size:10px;border-bottom:1px solid var(--border)}
-td{padding:8px 12px;border-bottom:1px solid rgba(26,37,53,.3);font-family:Consolas,monospace}
-</style></head><body>
-<div class="top"><h1>GHOSTLINK Admin</h1><span>Server Dashboard</span><span class="spacer"></span><button onclick="logout()">Logout</button></div>
-<div class="grid" id="stats"></div>
-<div class="panel"><div class="panel-hdr">Recent Messages</div><table><thead><tr><th>Time</th><th>Sender</th><th>Recipient</th><th>Size</th><th>Status</th></tr></thead><tbody id="msgTable"></tbody></table></div>
-<div class="panel"><div class="panel-hdr">Users</div><table><thead><tr><th>Username</th><th>User ID</th><th>Devices</th><th>Registered</th></tr></thead><tbody id="userTable"></tbody></table></div>
-<div class="panel"><div class="panel-hdr">Devices <span style="color:var(--dim);font-weight:400;font-size:10px">— click X to delete</span></div><table><thead><tr><th>Device ID</th><th>Platform</th><th>Name</th><th>Registered</th><th>Last Seen</th><th></th></tr></thead><tbody id="devTable"></tbody></table></div>
-<div class="panel"><div class="panel-hdr">Groups</div><table><thead><tr><th>Group ID</th><th>Name</th><th>Members</th><th>Created</th></tr></thead><tbody id="grpTable"></tbody></table></div>
-<div class="panel"><div class="panel-hdr">Admin Sessions</div><table><thead><tr><th>Session ID</th><th>IP</th><th>Login</th><th>Last Activity</th><th>Status</th></tr></thead><tbody id="sessTable"></tbody></table></div>
-<div class="panel"><div class="panel-hdr">Files <span style="color:var(--dim);font-weight:400;font-size:10px">— countdown to auto-deletion</span></div><table><thead><tr><th>File ID</th><th>Sender</th><th>Recipient</th><th>Orig Size</th><th>Enc Size</th><th>Uploaded</th><th>Countdown</th><th>Status</th></tr></thead><tbody id="fileTable"></tbody></table></div>
-<script>
-let fileData=[];
-async function refresh(){
-try{const r=await fetch('/api/v1/admin/stats');
-if(r.status===401){location='/admin/login';return}
-const d=await r.json();
-fileData=d.files||[];
-document.getElementById('stats').innerHTML=
-'<div class="card accent"><div class="val">'+d.total_users+'</div><div class="lbl">Users</div></div>'+'<div class="card ok"><div class="val">'+d.total_devices+'</div><div class="lbl">All Devices</div></div>'+'<div class="card ok"><div class="val">'+d.active_now+'</div><div class="lbl">Active Now</div></div>'+'<div class="card ok"><div class="val">'+d.active_1min+'</div><div class="lbl">Active (5 min)</div></div>'+'<div class="card accent"><div class="val">'+d.active_today+'</div><div class="lbl">Active Today</div></div>'+'<div class="card warn"><div class="val">'+d.os_windows+'/'+d.os_android+'/'+d.os_ios+'</div><div class="lbl">Win/Android/iOS</div></div>'+'<div class="card warn"><div class="val">'+d.avg_latency_ms+'ms</div><div class="lbl">Avg Msg Latency</div></div>'+'<div class="card danger"><div class="val">'+d.file_count+'</div><div class="lbl">Files</div></div>'+'<div class="card danger"><div class="val">'+d.file_total_gb.toFixed(3)+'</div><div class="lbl">GB Allocated</div></div>';
-document.getElementById('msgTable').innerHTML=(d.recent_messages||[]).map(m=>'<tr><td>'+m.ts+'</td><td>'+m.sender.substring(0,12)+'</td><td>'+m.recipient.substring(0,12)+'</td><td>'+m.size+'B</td><td>'+(m.delivered?'Delivered':'Pending')+'</td></tr>').join('');
-document.getElementById('devTable').innerHTML=(d.devices||[]).map(function(dv){return'<tr><td>'+dv.id.substring(0,16)+'</td><td>'+dv.platform+'</td><td>'+dv.name+'</td><td>'+dv.registered+'</td><td>'+dv.last_seen+'</td><td><button onclick="delDev(this.dataset.id)" data-id="'+dv.id+'" style="background:var(--danger);color:#fff;border:none;padding:1px 8px;border-radius:3px;cursor:pointer;font-size:10px">X</button></td></tr>';}).join('');
-document.getElementById('grpTable').innerHTML=(d.groups||[]).map(g=>'<tr><td>'+g.id.substring(0,12)+'</td><td>'+g.name+'</td><td>'+g.members+'</td><td>'+g.created+'</td></tr>').join('');
-document.getElementById('userTable').innerHTML=(d.users||[]).map(u=>'<tr><td>'+u.username+'</td><td>'+u.user_id.substring(0,16)+'</td><td>'+u.devices+'</td><td>'+u.created+'</td></tr>').join('');
-document.getElementById('sessTable').innerHTML=(d.sessions||[]).map(s=>'<tr><td>'+s.id.substring(0,12)+'</td><td>'+s.ip+'</td><td>'+s.login_at+'</td><td>'+s.last_activity+'</td><td><span style="color:'+(s.active?'var(--ok)':'var(--dim)')+'">'+(s.active?'Active':'Ended')+'</span></td></tr>').join('');}catch(e){}}
-function fmtSize(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
-function updateCountdowns(){
-let h='';const n=Date.now();
-for(const f of fileData){
-const e=new Date(f.expires_at+'Z').getTime();const r=e-n;
-let d,c;
-if(f.downloaded){d='DOWNLOADED';c='var(--ok)';}
-else if(r<=0){d='EXPIRED';c='var(--danger)';}
-else{const hh=Math.floor(r/3600000);const mm=Math.floor((r%3600000)/60000);const ss=Math.floor((r%60000)/1000);const ms=r%1000;
-d=hh+':'+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')+'.'+String(ms).padStart(3,'0');
-c=r<300000?'var(--danger)':r<1800000?'var(--warn)':'var(--ok)';}
-h+='<tr><td>'+f.id.substring(0,12)+'</td><td>'+f.sender+'</td><td>'+f.recipient+'</td><td>'+fmtSize(f.orig_size)+'</td><td>'+fmtSize(f.enc_size)+'</td><td>'+f.server_ts+'</td><td style="color:'+c+';font-family:Consolas,monospace;font-weight:600">'+d+'</td><td>'+(f.downloaded?'<span style="color:var(--ok)">Done</span>':'<span style="color:var(--warn)">Waiting</span>')+'</td></tr>';}
-document.getElementById('fileTable').innerHTML=h;}
-async function logout(){await fetch('/api/v1/admin/logout',{method:'POST'});location='/admin/login'}
-async function delDev(id){if(!id)id=this.dataset.id;if(confirm('Delete device '+id.substring(0,16)+'?')){await fetch('/api/v1/admin/devices/'+id,{method:'DELETE'});refresh()}}
-setInterval(updateCountdowns,50);
-setInterval(refresh,8000);refresh();
-</script></body></html>""")
+def _dir_size(path: str) -> int:
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file():
+                try: total += entry.stat().st_size
+                except OSError: pass
+    except OSError:
+        pass
+    return total
+
+def _fmt_uptime(secs: float) -> str:
+    s = int(secs)
+    d, s = divmod(s, 86400); h, s = divmod(s, 3600); m, s = divmod(s, 60)
+    if d: return f"{d}d {h}h {m}m"
+    if h: return f"{h}h {m}m {s}s"
+    if m: return f"{m}m {s}s"
+    return f"{s}s"
 
 @app.get("/api/v1/admin/stats")
 async def admin_stats(session=Depends(require_admin)):
     files = db.execute("SELECT id, sender_device_id, recipient_device_id, original_size, encrypted_size, server_ts, expires_at, downloaded FROM file_transfers ORDER BY server_ts DESC").fetchall()
     total_enc_bytes = sum(f[4] for f in files)
-    # Active client counts
     active_now = db.execute("SELECT COUNT(*) FROM devices WHERE last_seen > datetime('now','-60 seconds')").fetchone()[0]
     active_1min = db.execute("SELECT COUNT(*) FROM devices WHERE last_seen > datetime('now','-5 minutes')").fetchone()[0]
-    # OS breakdown
-    os_counts = {}
-    for row in db.execute("SELECT platform, COUNT(*) FROM devices GROUP BY platform").fetchall():
-        os_counts[row[0]] = row[1]
-    # Latency stats (avg ms between send and delivery for recent messages)
+    os_counts = {row[0]: row[1] for row in db.execute("SELECT platform, COUNT(*) FROM devices GROUP BY platform").fetchall()}
     latency = db.execute("SELECT ROUND(AVG(latency_ms),1), MIN(latency_ms), MAX(latency_ms) FROM message_latency WHERE recorded_at > datetime('now','-1 hour')").fetchone()
+
+    # ── Volume / throughput ────────────────────────────────────────
+    msgs_1h = db.execute("SELECT COUNT(*) FROM messages WHERE server_ts > datetime('now','-1 hour')").fetchone()[0]
+    msgs_24h = db.execute("SELECT COUNT(*) FROM messages WHERE server_ts > datetime('now','-1 day')").fetchone()[0]
+    files_24h = db.execute("SELECT COUNT(*) FROM file_transfers WHERE server_ts > datetime('now','-1 day')").fetchone()[0]
+    bytes_24h = db.execute("SELECT COALESCE(SUM(LENGTH(envelope)),0) FROM messages WHERE server_ts > datetime('now','-1 day')").fetchone()[0]
+    avg_msg_size = db.execute("SELECT ROUND(AVG(LENGTH(envelope)),0) FROM messages").fetchone()[0] or 0
+    sealed_pending = db.execute("SELECT COUNT(*) FROM messages WHERE sealed=1 AND delivered=0").fetchone()[0]
+    v2_pending = db.execute("SELECT COUNT(*) FROM messages WHERE envelope_version>=2 AND delivered=0").fetchone()[0]
+    disappearing_pending = db.execute("SELECT COUNT(*) FROM messages WHERE expires_at IS NOT NULL AND delivered=0").fetchone()[0]
+
+    # ── Hourly activity histogram (last 24h, server-local) ────────
+    hourly = db.execute(
+        "SELECT strftime('%Y-%m-%d %H:00', server_ts) AS hr, COUNT(*) "
+        "FROM messages WHERE server_ts > datetime('now','-24 hours') "
+        "GROUP BY hr ORDER BY hr"
+    ).fetchall()
+    hourly_activity = [{"hour": r[0], "count": r[1]} for r in hourly]
+
+    # ── Security / audit ───────────────────────────────────────────
+    failed_24h = db.execute("SELECT COUNT(*) FROM login_attempts WHERE success=0 AND attempted_at > datetime('now','-1 day')").fetchone()[0]
+    failed_logins = [
+        {"ip": r[0], "hwid": (r[1] or "")[:16], "fp": (r[2] or "")[:8], "ts": r[3]}
+        for r in db.execute("SELECT ip, hwid, fingerprint_id, attempted_at FROM login_attempts WHERE success=0 ORDER BY attempted_at DESC LIMIT 50").fetchall()
+    ]
+    audit_rows = db.execute("SELECT actor, action, target, detail, ts FROM audit_log ORDER BY id DESC LIMIT 100").fetchall()
+    audit_log_rows = [{"actor": a[0], "action": a[1], "target": a[2], "detail": a[3], "ts": a[4]} for a in audit_rows]
+
+    # ── Pending requests / invites ────────────────────────────────
+    friend_pending = db.execute(
+        "SELECT fr.id, uf.username, ut.username, fr.reason, fr.created_at "
+        "FROM friend_requests fr JOIN users uf ON uf.id=fr.from_user_id "
+        "JOIN users ut ON ut.id=fr.to_user_id WHERE fr.status='pending' "
+        "ORDER BY fr.created_at DESC LIMIT 50"
+    ).fetchall()
+    group_pending = db.execute(
+        "SELECT gi.id, g.name, uf.username, ut.username, gi.reason, gi.created_at "
+        "FROM group_invites gi JOIN group_chats g ON g.id=gi.group_id "
+        "JOIN users uf ON uf.id=gi.from_user_id JOIN users ut ON ut.id=gi.to_user_id "
+        "WHERE gi.status='pending' ORDER BY gi.created_at DESC LIMIT 50"
+    ).fetchall()
+
+    # ── Top senders/recipients (24h, anonymized prefix) ───────────
+    top_send = db.execute(
+        "SELECT sender_device_id, COUNT(*) FROM messages WHERE server_ts > datetime('now','-1 day') "
+        "GROUP BY sender_device_id ORDER BY 2 DESC LIMIT 10"
+    ).fetchall()
+    top_recv = db.execute(
+        "SELECT recipient_device_id, COUNT(*) FROM messages WHERE server_ts > datetime('now','-1 day') "
+        "GROUP BY recipient_device_id ORDER BY 2 DESC LIMIT 10"
+    ).fetchall()
+
+    # ── Telemetry (in-memory, since startup) ──────────────────────
+    top_endpoints = [
+        {"path": p, "count": c, "errors": ERR_COUNTS.get(p, 0)}
+        for p, c in REQ_COUNTS.most_common(15)
+    ]
+    recent_latencies = [ms for _, ms, _ in REQ_LATENCY]
+    avg_req_ms = round(sum(recent_latencies)/len(recent_latencies), 1) if recent_latencies else 0
+    p95_req_ms = 0
+    if recent_latencies:
+        s = sorted(recent_latencies)
+        p95_req_ms = round(s[int(len(s)*0.95) - 1], 1) if len(s) > 1 else round(s[0], 1)
+    recent_errors = list(RECENT_ERRORS)[:50]
+
+    # ── Disk / DB ──────────────────────────────────────────────────
+    db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    files_dir_size = _dir_size(FILE_DIR)
+    try:
+        disk = shutil.disk_usage(os.path.dirname(DB_PATH))
+        disk_total = disk.total; disk_free = disk.free
+    except Exception:
+        disk_total = disk_free = 0
+
+    # ── Toggles ────────────────────────────────────────────────────
+    registration_enabled = setting_get("registration_enabled", "1") == "1"
+    maintenance_mode = setting_get("maintenance_mode", "0") == "1"
+
     return {
+        "uptime_sec": round(time.time() - STARTUP_TS, 1),
+        "uptime_fmt": _fmt_uptime(time.time() - STARTUP_TS),
+        "server_time_utc": datetime.now(tz=timezone.utc).isoformat(timespec='seconds'),
+        "version": "1.4.0",
+        "registration_enabled": registration_enabled,
+        "maintenance_mode": maintenance_mode,
         "total_users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
         "total_devices": db.execute("SELECT COUNT(*) FROM devices").fetchone()[0],
         "total_messages": db.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
         "undelivered": db.execute("SELECT COUNT(*) FROM messages WHERE delivered=0").fetchone()[0],
         "total_groups": db.execute("SELECT COUNT(*) FROM group_chats").fetchone()[0],
+        "total_friendships": db.execute("SELECT COUNT(*) FROM friendships").fetchone()[0],
         "active_today": db.execute("SELECT COUNT(*) FROM devices WHERE last_seen > datetime('now','-1 day')").fetchone()[0],
         "active_now": active_now,
         "active_1min": active_1min,
+        "msgs_1h": msgs_1h, "msgs_24h": msgs_24h, "files_24h": files_24h,
+        "bytes_24h": bytes_24h, "avg_msg_size": int(avg_msg_size),
+        "sealed_pending": sealed_pending,
+        "v2_pending": v2_pending,
+        "disappearing_pending": disappearing_pending,
+        "pq_available": PQ_AVAILABLE,
+        "pq_suite": "ECDH-P384+ML-KEM-1024" if PQ_AVAILABLE else "",
         "os_windows": os_counts.get("windows", 0),
         "os_android": os_counts.get("android", 0),
         "os_ios": os_counts.get("ios", 0),
@@ -1348,6 +1721,27 @@ async def admin_stats(session=Depends(require_admin)):
         "file_count": len(files),
         "file_total_bytes": total_enc_bytes,
         "file_total_gb": round(total_enc_bytes / (1024**3), 4),
+        "db_size_bytes": db_size,
+        "files_dir_bytes": files_dir_size,
+        "disk_free_bytes": disk_free,
+        "disk_total_bytes": disk_total,
+        "failed_logins_24h": failed_24h,
+        "pending_friend_requests": len(friend_pending),
+        "pending_group_invites": len(group_pending),
+        "requests_total": sum(REQ_COUNTS.values()),
+        "errors_total": sum(ERR_COUNTS.values()),
+        "avg_req_ms": avg_req_ms,
+        "p95_req_ms": p95_req_ms,
+        "ecdh_cache_size": len(ecdh_cache),
+        "hourly_activity": hourly_activity,
+        "top_senders": [{"id": r[0][:12], "count": r[1]} for r in top_send],
+        "top_recipients": [{"id": r[0][:12], "count": r[1]} for r in top_recv],
+        "top_endpoints": top_endpoints,
+        "recent_errors": recent_errors,
+        "audit_log": audit_log_rows,
+        "failed_logins": failed_logins,
+        "friend_requests_pending": [{"id": r[0], "from": r[1], "to": r[2], "reason": r[3], "created": r[4]} for r in friend_pending],
+        "group_invites_pending": [{"id": r[0], "group": r[1], "from": r[2], "to": r[3], "reason": r[4], "created": r[5]} for r in group_pending],
         "files": [{"id": f[0], "sender": f[1][:12], "recipient": f[2][:12], "orig_size": f[3], "enc_size": f[4], "server_ts": f[5], "expires_at": f[6], "downloaded": bool(f[7])} for f in files],
         "recent_messages": [{"ts": m[0], "sender": m[1], "recipient": m[2], "size": m[3], "delivered": bool(m[4])} for m in db.execute("SELECT server_ts, sender_device_id, recipient_device_id, LENGTH(envelope), delivered FROM messages ORDER BY server_ts DESC LIMIT 50").fetchall()],
         "devices": [{"id": d[0], "platform": d[1], "name": d[2], "registered": d[3], "last_seen": d[4] or "never"} for d in db.execute("SELECT id, platform, device_name, registered_at, last_seen FROM devices ORDER BY registered_at DESC LIMIT 100").fetchall()],
@@ -1362,7 +1756,371 @@ async def admin_delete_device(device_id: str, session=Depends(require_admin)):
     db.execute("DELETE FROM group_members WHERE device_id=?", (device_id,))
     db.execute("DELETE FROM devices WHERE id=?", (device_id,))
     db.commit()
+    audit_admin(session[0][:8], "delete_device", device_id, "")
     return {"deleted": device_id}
+
+# ── Admin Controls ────────────────────────────────────────────────
+@app.post("/api/v1/admin/control/purge-files")
+async def admin_purge_files(session=Depends(require_admin)):
+    rows = db.execute("SELECT id, storage_name FROM file_transfers WHERE expires_at < datetime('now') OR downloaded=1").fetchall()
+    removed = 0
+    for fid, name in rows:
+        path = os.path.join(FILE_DIR, name)
+        if os.path.isfile(path):
+            try: os.remove(path); removed += 1
+            except OSError: pass
+        db.execute("DELETE FROM file_transfers WHERE id=?", (fid,))
+    db.commit()
+    audit_admin(session[0][:8], "purge_files", "", f"removed={removed}")
+    return {"removed": removed}
+
+@app.post("/api/v1/admin/control/vacuum")
+async def admin_vacuum(session=Depends(require_admin)):
+    before = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    try:
+        db.execute("VACUUM")
+        db.commit()
+    except sqlite3.OperationalError as e:
+        raise HTTPException(409, f"VACUUM unavailable: {e}")
+    after = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    audit_admin(session[0][:8], "vacuum_db", "", f"saved={before-after}B")
+    return {"before": before, "after": after, "saved": before - after}
+
+@app.post("/api/v1/admin/control/clear-ecdh")
+async def admin_clear_ecdh(session=Depends(require_admin)):
+    with ecdh_lock:
+        n = len(ecdh_cache); ecdh_cache.clear()
+    audit_admin(session[0][:8], "clear_ecdh_cache", "", f"cleared={n}")
+    return {"cleared": n}
+
+@app.post("/api/v1/admin/control/wipe-rate-limits")
+async def admin_wipe_rate_limits(session=Depends(require_admin)):
+    n = len(rate_limits); rate_limits.clear()
+    audit_admin(session[0][:8], "wipe_rate_limits", "", f"buckets={n}")
+    return {"cleared_buckets": n}
+
+@app.post("/api/v1/admin/control/kill-sessions")
+async def admin_kill_other_sessions(session=Depends(require_admin)):
+    cur_sid = session[0]
+    db.execute("UPDATE admin_sessions SET logged_out=1 WHERE logged_out=0 AND id != ?", (cur_sid,))
+    n = db.execute("SELECT changes()").fetchone()[0]
+    db.commit()
+    audit_admin(cur_sid[:8], "kill_other_admin_sessions", "", f"killed={n}")
+    return {"killed": n}
+
+@app.post("/api/v1/admin/control/clear-undelivered")
+async def admin_clear_undelivered(session=Depends(require_admin)):
+    n = db.execute("SELECT COUNT(*) FROM messages WHERE delivered=0").fetchone()[0]
+    db.execute("DELETE FROM messages WHERE delivered=0")
+    db.commit()
+    audit_admin(session[0][:8], "clear_undelivered", "", f"deleted={n}")
+    return {"deleted": n}
+
+@app.post("/api/v1/admin/control/registration")
+async def admin_toggle_registration(request: Request, session=Depends(require_admin)):
+    body = await request.json()
+    enabled = bool(body.get("enabled", True))
+    setting_set("registration_enabled", "1" if enabled else "0")
+    audit_admin(session[0][:8], "toggle_registration", "", f"enabled={enabled}")
+    return {"registration_enabled": enabled}
+
+@app.post("/api/v1/admin/control/maintenance")
+async def admin_toggle_maintenance(request: Request, session=Depends(require_admin)):
+    body = await request.json()
+    enabled = bool(body.get("enabled", False))
+    setting_set("maintenance_mode", "1" if enabled else "0")
+    audit_admin(session[0][:8], "toggle_maintenance", "", f"enabled={enabled}")
+    return {"maintenance_mode": enabled}
+
+@app.delete("/api/v1/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, session=Depends(require_admin)):
+    devs = [r[0] for r in db.execute("SELECT id FROM devices WHERE user_id=?", (user_id,)).fetchall()]
+    # Remove file blobs owned by those devices
+    file_rows = db.execute(
+        "SELECT id, storage_name FROM file_transfers WHERE sender_device_id IN ({0}) OR recipient_device_id IN ({0})".format(
+            ",".join("?"*len(devs)) or "''"
+        ),
+        devs * 2 if devs else []
+    ).fetchall() if devs else []
+    for _, name in file_rows:
+        path = os.path.join(FILE_DIR, name)
+        if os.path.isfile(path):
+            try: os.remove(path)
+            except OSError: pass
+    if devs:
+        ph = ",".join("?" * len(devs))
+        db.execute(f"DELETE FROM file_transfers WHERE sender_device_id IN ({ph}) OR recipient_device_id IN ({ph})", devs * 2)
+        db.execute(f"DELETE FROM messages WHERE sender_device_id IN ({ph}) OR recipient_device_id IN ({ph})", devs * 2)
+        db.execute(f"DELETE FROM group_members WHERE device_id IN ({ph})", devs)
+        db.execute(f"DELETE FROM devices WHERE id IN ({ph})", devs)
+    db.execute("DELETE FROM friendships WHERE user_a=? OR user_b=?", (user_id, user_id))
+    db.execute("DELETE FROM friend_requests WHERE from_user_id=? OR to_user_id=?", (user_id, user_id))
+    db.execute("DELETE FROM group_invites WHERE from_user_id=? OR to_user_id=?", (user_id, user_id))
+    db.execute("DELETE FROM users WHERE id=?", (user_id,))
+    db.commit()
+    audit_admin(session[0][:8], "delete_user", user_id, f"devices={len(devs)} files={len(file_rows)}")
+    return {"deleted_user": user_id, "devices_removed": len(devs), "files_removed": len(file_rows)}
+
+@app.delete("/api/v1/admin/sessions/{target_sid}")
+async def admin_kill_session(target_sid: str, session=Depends(require_admin)):
+    db.execute("UPDATE admin_sessions SET logged_out=1 WHERE id=?", (target_sid,))
+    db.commit()
+    audit_admin(session[0][:8], "kill_session", target_sid[:12], "")
+    return {"killed": target_sid}
+
+# ── Admin Dashboard HTML ──────────────────────────────────────────
+@app.get("/admin")
+async def admin_dashboard(session=Depends(require_admin)):
+    return HTMLResponse(r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GHOSTLINK Admin</title>
+<style>
+:root{--bg:#0a0e17;--bg2:#111827;--bg3:#0d1420;--border:#1a2535;--text:#c8d6e5;--dim:#6e7a8a;--accent:#00d4ff;--ok:#2ed573;--warn:#ffc048;--danger:#ff4757;--purple:#a55eea}
+*,*::before,*::after{box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:13px;margin:0;padding:0}
+.top{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:18px;position:sticky;top:0;z-index:50}
+.top h1{font-size:18px;margin:0;color:var(--accent);letter-spacing:1.5px;font-weight:600}
+.top .meta{color:var(--dim);font-size:11px;font-family:Consolas,monospace}
+.top .spacer{flex:1}
+.top .toggle{display:inline-flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:11px;cursor:pointer;user-select:none}
+.top .toggle .dot{width:8px;height:8px;border-radius:50%;background:var(--danger);box-shadow:0 0 6px var(--danger)}
+.top .toggle.on .dot{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.top button.btn{background:transparent;border:1px solid var(--border);color:var(--dim);padding:6px 12px;border-radius:5px;cursor:pointer;font-size:11px;letter-spacing:.3px}
+.top button.btn:hover{color:var(--text);border-color:var(--accent)}
+.top button.danger{color:var(--danger);border-color:rgba(255,71,87,.4)}
+.top button.danger:hover{background:rgba(255,71,87,.1);color:var(--danger);border-color:var(--danger)}
+.row{display:flex;gap:12px;padding:0 20px;flex-wrap:wrap}
+.row.tight{padding:14px 20px 6px;gap:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;padding:14px 20px 6px}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:14px;min-width:0;overflow:hidden}
+.card .val{font-size:26px;font-weight:700;line-height:1.1;font-family:Consolas,monospace}
+.card .lbl{font-size:10px;color:var(--dim);text-transform:uppercase;margin-top:4px;letter-spacing:.6px}
+.card.accent .val{color:var(--accent)}.card.ok .val{color:var(--ok)}.card.warn .val{color:var(--warn)}.card.danger .val{color:var(--danger)}.card.purple .val{color:var(--purple)}
+.panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;margin:0 20px 14px;overflow:hidden}
+.panel-hdr{padding:10px 14px;border-bottom:1px solid var(--border);font-weight:600;color:var(--accent);letter-spacing:.6px;font-size:12px;display:flex;align-items:center;gap:10px}
+.panel-hdr .pill{background:var(--bg3);color:var(--dim);font-weight:400;border:1px solid var(--border);padding:2px 8px;border-radius:99px;font-size:10px}
+.panel-hdr .actions{margin-left:auto;display:flex;gap:6px}
+.panel-hdr .actions button{background:var(--bg3);border:1px solid var(--border);color:var(--dim);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:10px}
+.panel-hdr .actions button:hover{color:var(--text);border-color:var(--accent)}
+.panel-hdr .actions button.danger{color:var(--danger);border-color:rgba(255,71,87,.4)}
+.panel-hdr .actions button.danger:hover{background:rgba(255,71,87,.1)}
+.panel .body{max-height:360px;overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{text-align:left;padding:7px 12px;color:var(--dim);text-transform:uppercase;font-size:10px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg2);z-index:2}
+td{padding:7px 12px;border-bottom:1px solid rgba(26,37,53,.4);font-family:Consolas,monospace;vertical-align:top}
+tr:hover td{background:rgba(0,212,255,.03)}
+.tinybtn{background:var(--danger);color:#fff;border:none;padding:1px 8px;border-radius:3px;cursor:pointer;font-size:10px}
+.tinybtn.warn{background:var(--warn);color:#1a1a1a}
+.tinybtn:hover{filter:brightness(1.15)}
+.chart{display:flex;align-items:flex-end;gap:3px;height:90px;padding:8px 14px 12px}
+.chart .bar{flex:1;background:linear-gradient(180deg,var(--accent),rgba(0,212,255,.2));border-radius:2px 2px 0 0;position:relative;min-height:1px;transition:opacity .2s}
+.chart .bar:hover{opacity:.7}
+.chart .bar .tt{display:none;position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--border);padding:3px 6px;border-radius:3px;font-size:10px;white-space:nowrap;color:var(--text);font-family:Consolas,monospace;z-index:10}
+.chart .bar:hover .tt{display:block}
+.statusdot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px}
+.statusdot.ok{background:var(--ok)}.statusdot.warn{background:var(--warn)}.statusdot.dim{background:var(--dim)}
+.bars2col{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:10px 14px}
+.barlist{display:flex;flex-direction:column;gap:6px}
+.barlist .item{display:flex;align-items:center;gap:8px;font-size:11px;font-family:Consolas,monospace}
+.barlist .label{flex:0 0 140px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.barlist .track{flex:1;background:var(--bg3);height:10px;border-radius:3px;overflow:hidden;border:1px solid var(--border)}
+.barlist .fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--purple))}
+.barlist .num{flex:0 0 40px;text-align:right;color:var(--dim)}
+.tag{display:inline-block;padding:1px 7px;border-radius:99px;font-size:10px;letter-spacing:.4px;font-weight:600}
+.tag.ok{background:rgba(46,213,115,.15);color:var(--ok);border:1px solid rgba(46,213,115,.3)}
+.tag.danger{background:rgba(255,71,87,.15);color:var(--danger);border:1px solid rgba(255,71,87,.3)}
+.tag.warn{background:rgba(255,192,72,.15);color:var(--warn);border:1px solid rgba(255,192,72,.3)}
+.empty{padding:24px;text-align:center;color:var(--dim);font-style:italic}
+.kbd{background:var(--bg3);border:1px solid var(--border);border-bottom-width:2px;border-radius:3px;padding:0 4px;font-family:Consolas,monospace;font-size:10px;color:var(--dim)}
+</style></head><body>
+<div class="top">
+<h1>GHOSTLINK</h1>
+<span class="meta" id="metaUptime">uptime —</span>
+<span class="meta" id="metaTime">—</span>
+<span class="meta" id="metaVer">—</span>
+<span class="spacer"></span>
+<span class="toggle" id="regToggle" onclick="toggleSetting('registration', !regOn)"><span class="dot"></span><span id="regLbl">Registration —</span></span>
+<span class="toggle" id="mntToggle" onclick="toggleSetting('maintenance', !mntOn)"><span class="dot"></span><span id="mntLbl">Maintenance —</span></span>
+<button class="btn" onclick="refresh()">Refresh</button>
+<button class="btn danger" onclick="logout()">Logout</button>
+</div>
+
+<div class="grid" id="stats"></div>
+
+<div class="row">
+<div class="panel" style="flex:1 1 60%;margin:0 0 14px"><div class="panel-hdr">Messages — last 24h <span class="pill" id="hourlyTotal">—</span></div><div class="chart" id="hourlyChart"></div></div>
+<div class="panel" style="flex:1 1 35%;margin:0 0 14px"><div class="panel-hdr">Top Endpoints (since boot)</div><div class="barlist" id="endpointList" style="padding:10px 14px"></div></div>
+</div>
+
+<div class="panel"><div class="panel-hdr">Server Controls
+<div class="actions">
+<button onclick="ctrl('purge-files','Purge expired/downloaded files?')">Purge Files</button>
+<button onclick="ctrl('vacuum','Vacuum the database? Reclaims disk space.')">VACUUM DB</button>
+<button onclick="ctrl('clear-ecdh','Clear ephemeral ECDH session cache?')">Clear ECDH Cache</button>
+<button onclick="ctrl('wipe-rate-limits','Reset all rate-limit buckets?')">Reset Rate Limits</button>
+<button class="danger" onclick="ctrl('kill-sessions','Sign out every OTHER admin session?')">Kill Other Admin Sessions</button>
+<button class="danger" onclick="ctrl('clear-undelivered','PERMANENTLY drop all undelivered messages? This cannot be undone.')">Drop Undelivered</button>
+</div>
+</div><div style="padding:8px 14px;color:var(--dim);font-size:11px">Use sparingly. Every control action is recorded in the audit log.</div></div>
+
+<div class="panel"><div class="panel-hdr">Top Senders/Recipients — 24h</div>
+<div class="bars2col">
+<div><div style="color:var(--dim);font-size:10px;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px">Senders</div><div class="barlist" id="topSenders"></div></div>
+<div><div style="color:var(--dim);font-size:10px;letter-spacing:.5px;text-transform:uppercase;margin-bottom:6px">Recipients</div><div class="barlist" id="topRecips"></div></div>
+</div></div>
+
+<div class="panel"><div class="panel-hdr">Pending Friend Requests <span class="pill" id="frPill">0</span></div><div class="body"><table><thead><tr><th>From</th><th>To</th><th>Reason</th><th>Created</th></tr></thead><tbody id="frTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Pending Group Invites <span class="pill" id="giPill">0</span></div><div class="body"><table><thead><tr><th>Group</th><th>From</th><th>To</th><th>Reason</th><th>Created</th></tr></thead><tbody id="giTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Failed Logins <span class="pill" id="flPill">0</span></div><div class="body"><table><thead><tr><th>IP</th><th>HWID</th><th>Fingerprint</th><th>Time</th></tr></thead><tbody id="flTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Recent Errors <span class="pill" id="errPill">0</span></div><div class="body"><table><thead><tr><th>Time</th><th>Path</th><th>Status</th><th>Detail</th></tr></thead><tbody id="errTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Audit Log <span class="pill">last 100</span></div><div class="body"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead><tbody id="auditTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Recent Messages</div><div class="body"><table><thead><tr><th>Time</th><th>Sender</th><th>Recipient</th><th>Size</th><th>Status</th></tr></thead><tbody id="msgTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Users
+<div class="actions"><span style="color:var(--dim);font-size:10px">click X to nuke user + all their data</span></div>
+</div><div class="body"><table><thead><tr><th>Username</th><th>User ID</th><th>Devices</th><th>Registered</th><th></th></tr></thead><tbody id="userTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Devices <span class="pill">click X to delete</span></div><div class="body"><table><thead><tr><th>Device ID</th><th>Platform</th><th>Name</th><th>Registered</th><th>Last Seen</th><th></th></tr></thead><tbody id="devTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Groups</div><div class="body"><table><thead><tr><th>Group ID</th><th>Name</th><th>Members</th><th>Created</th></tr></thead><tbody id="grpTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Admin Sessions</div><div class="body"><table><thead><tr><th>Session ID</th><th>IP</th><th>Login</th><th>Last Activity</th><th>Status</th><th></th></tr></thead><tbody id="sessTable"></tbody></table></div></div>
+
+<div class="panel"><div class="panel-hdr">Files <span class="pill">live countdown</span></div><div class="body"><table><thead><tr><th>File ID</th><th>Sender</th><th>Recipient</th><th>Orig</th><th>Enc</th><th>Uploaded</th><th>Countdown</th><th>Status</th></tr></thead><tbody id="fileTable"></tbody></table></div></div>
+
+<script>
+let fileData=[],regOn=false,mntOn=false;
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+function fmtSize(b){if(!b&&b!==0)return'—';if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
+function fmtPct(part,total){if(!total)return'0%';return((part/total)*100).toFixed(1)+'%'}
+
+async function refresh(){
+  try{
+    const r=await fetch('/api/v1/admin/stats');
+    if(r.status===401){location='/admin/login';return}
+    const d=await r.json();
+    fileData=d.files||[];
+    regOn=d.registration_enabled;mntOn=d.maintenance_mode;
+    document.getElementById('metaUptime').textContent='uptime '+d.uptime_fmt;
+    document.getElementById('metaTime').textContent=d.server_time_utc+' UTC';
+    document.getElementById('metaVer').textContent='v'+d.version;
+    document.getElementById('regToggle').classList.toggle('on',regOn);
+    document.getElementById('regLbl').textContent='Registration '+(regOn?'ON':'OFF');
+    document.getElementById('mntToggle').classList.toggle('on',mntOn);
+    document.getElementById('mntLbl').textContent='Maintenance '+(mntOn?'ON':'OFF');
+
+    document.getElementById('stats').innerHTML=[
+      ['accent',d.total_users,'Users'],
+      ['ok',d.total_devices,'Devices'],
+      ['ok',d.active_now,'Active Now (60s)'],
+      ['ok',d.active_1min,'Active (5 min)'],
+      ['accent',d.active_today,'Active Today'],
+      ['warn',d.os_windows+'/'+d.os_android+'/'+d.os_ios,'Win/Android/iOS'],
+      ['accent',d.total_messages.toLocaleString(),'Total Messages'],
+      ['ok',d.msgs_1h.toLocaleString(),'Msgs / 1h'],
+      ['ok',d.msgs_24h.toLocaleString(),'Msgs / 24h'],
+      ['warn',d.undelivered,'Undelivered'],
+      ['purple',d.total_groups,'Groups'],
+      ['purple',d.total_friendships,'Friendships'],
+      ['warn',d.avg_latency_ms+'ms','Avg Msg Latency'],
+      ['warn',d.avg_req_ms+'ms','Avg Req'],
+      ['warn',d.p95_req_ms+'ms','p95 Req'],
+      ['danger',d.file_count,'Files'],
+      ['danger',fmtSize(d.file_total_bytes),'Encrypted Stored'],
+      ['accent',fmtSize(d.files_dir_bytes),'Files Folder'],
+      ['accent',fmtSize(d.db_size_bytes),'Database'],
+      ['warn',fmtSize(d.disk_free_bytes)+' free','Disk'],
+      ['danger',d.failed_logins_24h,'Failed Logins 24h'],
+      ['warn',d.pending_friend_requests,'Pending Friend Req'],
+      ['warn',d.pending_group_invites,'Pending Group Inv'],
+      ['purple',d.requests_total.toLocaleString(),'Reqs Since Boot'],
+      ['danger',d.errors_total,'Errors Since Boot'],
+      ['accent',d.ecdh_cache_size,'ECDH Cache'],
+      ['ok',fmtSize(d.bytes_24h),'Msg Bytes / 24h'],
+      ['ok',fmtSize(d.avg_msg_size),'Avg Msg Size'],
+      [d.pq_available?'ok':'danger',d.pq_available?'READY':'OFF','PQ Hybrid'],
+      ['purple',d.sealed_pending,'Sealed Pending'],
+      ['purple',d.v2_pending,'v2 Pending'],
+      ['warn',d.disappearing_pending,'Disappearing Pending'],
+    ].map(c=>'<div class="card '+c[0]+'"><div class="val">'+esc(c[1])+'</div><div class="lbl">'+esc(c[2])+'</div></div>').join('');
+
+    const hh=d.hourly_activity||[];const hMax=Math.max(1,...hh.map(x=>x.count));
+    const hTotal=hh.reduce((a,b)=>a+b.count,0);
+    document.getElementById('hourlyTotal').textContent=hTotal.toLocaleString()+' msgs';
+    const buckets=[];for(let i=23;i>=0;i--){const dt=new Date(Date.now()-i*3600000);const k=dt.toISOString().slice(0,13).replace('T',' ')+':00';const found=hh.find(x=>x.hour===k);buckets.push({hour:dt.getUTCHours()+':00',count:found?found.count:0});}
+    document.getElementById('hourlyChart').innerHTML=buckets.map(b=>'<div class="bar" style="height:'+(b.count/hMax*100)+'%"><span class="tt">'+b.hour+' — '+b.count+'</span></div>').join('');
+
+    const ep=d.top_endpoints||[];const eMax=Math.max(1,...ep.map(x=>x.count));
+    document.getElementById('endpointList').innerHTML=ep.map(x=>'<div class="item"><span class="label">'+esc(x.path)+'</span><span class="track"><span class="fill" style="width:'+(x.count/eMax*100)+'%"></span></span><span class="num">'+x.count+(x.errors?' <span style="color:var(--danger)">('+x.errors+')</span>':'')+'</span></div>').join('')||'<div class="empty">no traffic yet</div>';
+
+    const ts=d.top_senders||[];const tsMax=Math.max(1,...ts.map(x=>x.count));
+    document.getElementById('topSenders').innerHTML=ts.map(x=>'<div class="item"><span class="label">'+esc(x.id)+'</span><span class="track"><span class="fill" style="width:'+(x.count/tsMax*100)+'%"></span></span><span class="num">'+x.count+'</span></div>').join('')||'<div class="empty">—</div>';
+    const tr=d.top_recipients||[];const trMax=Math.max(1,...tr.map(x=>x.count));
+    document.getElementById('topRecips').innerHTML=tr.map(x=>'<div class="item"><span class="label">'+esc(x.id)+'</span><span class="track"><span class="fill" style="width:'+(x.count/trMax*100)+'%"></span></span><span class="num">'+x.count+'</span></div>').join('')||'<div class="empty">—</div>';
+
+    const fr=d.friend_requests_pending||[];document.getElementById('frPill').textContent=fr.length;
+    document.getElementById('frTable').innerHTML=fr.map(r=>'<tr><td>'+esc(r.from)+'</td><td>'+esc(r.to)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.created)+'</td></tr>').join('')||'<tr><td colspan="4" class="empty">none</td></tr>';
+    const gi=d.group_invites_pending||[];document.getElementById('giPill').textContent=gi.length;
+    document.getElementById('giTable').innerHTML=gi.map(r=>'<tr><td>'+esc(r.group)+'</td><td>'+esc(r.from)+'</td><td>'+esc(r.to)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.created)+'</td></tr>').join('')||'<tr><td colspan="5" class="empty">none</td></tr>';
+
+    const fl=d.failed_logins||[];document.getElementById('flPill').textContent=fl.length;
+    document.getElementById('flTable').innerHTML=fl.map(r=>'<tr><td>'+esc(r.ip)+'</td><td>'+esc(r.hwid)+'</td><td>'+esc(r.fp)+'</td><td>'+esc(r.ts)+'</td></tr>').join('')||'<tr><td colspan="4" class="empty">none</td></tr>';
+
+    const er=d.recent_errors||[];document.getElementById('errPill').textContent=er.length;
+    document.getElementById('errTable').innerHTML=er.map(r=>'<tr><td>'+esc(r.ts)+'</td><td>'+esc(r.path)+'</td><td><span class="tag '+(r.status>=500?'danger':'warn')+'">'+esc(r.status)+'</span></td><td>'+esc(r.detail)+'</td></tr>').join('')||'<tr><td colspan="4" class="empty">none</td></tr>';
+
+    const al=d.audit_log||[];
+    document.getElementById('auditTable').innerHTML=al.map(r=>'<tr><td>'+esc(r.ts)+'</td><td>'+esc(r.actor)+'</td><td><span class="tag ok">'+esc(r.action)+'</span></td><td>'+esc(r.target)+'</td><td>'+esc(r.detail)+'</td></tr>').join('')||'<tr><td colspan="5" class="empty">none</td></tr>';
+
+    document.getElementById('msgTable').innerHTML=(d.recent_messages||[]).map(m=>'<tr><td>'+esc(m.ts)+'</td><td>'+esc(m.sender.substring(0,12))+'</td><td>'+esc(m.recipient.substring(0,12))+'</td><td>'+m.size+'B</td><td><span class="tag '+(m.delivered?'ok':'warn')+'">'+(m.delivered?'Delivered':'Pending')+'</span></td></tr>').join('');
+
+    document.getElementById('devTable').innerHTML=(d.devices||[]).map(dv=>'<tr><td>'+esc(dv.id.substring(0,16))+'</td><td>'+esc(dv.platform)+'</td><td>'+esc(dv.name)+'</td><td>'+esc(dv.registered)+'</td><td>'+esc(dv.last_seen)+'</td><td><button class="tinybtn" onclick="delDev(\''+esc(dv.id)+'\')">X</button></td></tr>').join('');
+    document.getElementById('grpTable').innerHTML=(d.groups||[]).map(g=>'<tr><td>'+esc(g.id.substring(0,12))+'</td><td>'+esc(g.name)+'</td><td>'+g.members+'</td><td>'+esc(g.created)+'</td></tr>').join('');
+    document.getElementById('userTable').innerHTML=(d.users||[]).map(u=>'<tr><td>'+esc(u.username)+'</td><td>'+esc(u.user_id.substring(0,16))+'</td><td>'+u.devices+'</td><td>'+esc(u.created)+'</td><td><button class="tinybtn" onclick="delUser(\''+esc(u.user_id)+'\',\''+esc(u.username)+'\')">X</button></td></tr>').join('');
+    document.getElementById('sessTable').innerHTML=(d.sessions||[]).map(s=>'<tr><td>'+esc(s.id.substring(0,12))+'</td><td>'+esc(s.ip)+'</td><td>'+esc(s.login_at)+'</td><td>'+esc(s.last_activity)+'</td><td><span class="tag '+(s.active?'ok':'warn')+'">'+(s.active?'Active':'Ended')+'</span></td><td>'+(s.active?'<button class="tinybtn warn" onclick="killSess(\''+esc(s.id)+'\')">Kill</button>':'')+'</td></tr>').join('');
+  }catch(e){console.error(e)}
+}
+
+function updateCountdowns(){
+  let h='';const n=Date.now();
+  for(const f of fileData){
+    if(!f.expires_at){continue}
+    const e=new Date(f.expires_at+'Z').getTime();const r=e-n;
+    let d,c;
+    if(f.downloaded){d='DOWNLOADED';c='var(--ok)';}
+    else if(r<=0){d='EXPIRED';c='var(--danger)';}
+    else{const hh=Math.floor(r/3600000);const mm=Math.floor((r%3600000)/60000);const ss=Math.floor((r%60000)/1000);const ms=r%1000;
+      d=hh+':'+String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')+'.'+String(ms).padStart(3,'0');
+      c=r<300000?'var(--danger)':r<1800000?'var(--warn)':'var(--ok)';}
+    h+='<tr><td>'+esc(f.id.substring(0,12))+'</td><td>'+esc(f.sender)+'</td><td>'+esc(f.recipient)+'</td><td>'+fmtSize(f.orig_size)+'</td><td>'+fmtSize(f.enc_size)+'</td><td>'+esc(f.server_ts)+'</td><td style="color:'+c+';font-weight:600">'+d+'</td><td>'+(f.downloaded?'<span class="tag ok">Done</span>':'<span class="tag warn">Waiting</span>')+'</td></tr>';
+  }
+  document.getElementById('fileTable').innerHTML=h||'<tr><td colspan="8" class="empty">no files</td></tr>';
+}
+
+async function ctrl(action,msg){
+  if(!confirm(msg))return;
+  const r=await fetch('/api/v1/admin/control/'+action,{method:'POST'});
+  const j=await r.json().catch(()=>({}));
+  alert(action+': '+JSON.stringify(j));
+  refresh();
+}
+async function toggleSetting(which,enabled){
+  const path=which==='registration'?'registration':'maintenance';
+  await fetch('/api/v1/admin/control/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+  refresh();
+}
+async function delDev(id){if(confirm('Delete device '+id.substring(0,16)+'?')){await fetch('/api/v1/admin/devices/'+id,{method:'DELETE'});refresh()}}
+async function delUser(id,name){if(prompt('To delete user "'+name+'" and ALL their data, type the username:')!==name)return;await fetch('/api/v1/admin/users/'+id,{method:'DELETE'});refresh()}
+async function killSess(id){if(confirm('Kill admin session '+id.substring(0,12)+'?')){await fetch('/api/v1/admin/sessions/'+id,{method:'DELETE'});refresh()}}
+async function logout(){await fetch('/api/v1/admin/logout',{method:'POST'});location='/admin/login'}
+
+setInterval(updateCountdowns,50);
+setInterval(refresh,8000);
+refresh();
+</script></body></html>""")
 
 if __name__ == "__main__":
     import uvicorn
