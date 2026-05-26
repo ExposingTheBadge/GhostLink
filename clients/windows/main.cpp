@@ -6,7 +6,7 @@
 #include <QtNetwork>
 #include <QtCore>
 
-#define CLIENT_VERSION "2.3.1"
+#define CLIENT_VERSION "2.3.2"
 
 extern "C" {
 #include "client.h"
@@ -109,57 +109,32 @@ static bool gDisappearEnabled = false;
 static int  gDisappearSeconds = 60;
 static bool gRichText = true;
 
-/* Network anonymity: one transport at a time, exclusive. We deliberately
- * do NOT support stacking (e.g. Nym -> Tor -> onion). Stacking burns latency
- * without buying real security against the threats either layer is designed
- * for, and the failure modes are worse (which layer dropped the packet?).
+/* Network-layer transport selector — one transport at a time, exclusive.
+ *
+ * This deals with *one* specific threat: an on-path observer (ISP, gateway,
+ * server-side logger) linking a client IP to a username over time. The rest
+ * of the anonymity stack (E2EE Double Ratchet, padded envelopes, RSA-3072
+ * blind-signature anonymous credentials, PII-free signup) is already in
+ * effect whether this is set to Direct or Tor.
  *
  *   Direct: WinHTTP talks straight to the server. Default.
  *   Tor   : SOCKS5 -> local tor daemon (127.0.0.1:9050 stock, 9150 Browser).
- *           Defeats passive ISP-level observers; partial against global
- *           passive adversaries (they can correlate by timing/volume).
- *   Nym   : SOCKS5 -> local nym-socks5-client (127.0.0.1:1080 default),
- *           which Sphinx-wraps every packet, pads to fixed size, and shuffles
- *           through the mixnet with Poisson delays. Defeats the global
- *           passive adversary too, at a 1-3 second latency cost.
+ *           Hides client IP from the server and server IP from the client.
+ *           See docs/tor.md.
  *
- * All three apply the same way: network_set_proxy(NULL | "socks=host:port").
- * The mode-specific knowledge (SP address for Nym, port choice for Tor) is
- * persisted and surfaced in Settings -> Network. See docs/tor.md and
- * docs/nym.md for the matching server-side configuration.
- *
- * Failure semantics: every mode fails closed. If tor isn't running, or the
- * Nym SOCKS5 client isn't running, requests error out — we never silently
- * fall back to clearnet. */
-enum class Transport { Direct = 0, Tor = 1, Nym = 2 };
+ * Failure semantics: fails closed. If tor isn't running, requests error out
+ * — we never silently fall back to clearnet. */
+enum class Transport { Direct = 0, Tor = 1 };
 
 static Transport gTransport = Transport::Direct;
 static QString   gTorProxy  = "127.0.0.1:9050";
-static QString   gNymProxy  = "127.0.0.1:1080";
-/* The Nym Service Provider address is a triplet of base58 strings separated
- * by '@' (encryption_key.identity_key@gateway_identity). It is what nym-socks5-client
- * tunnels every packet to; the SP then translates Sphinx -> HTTP to the
- * GHOSTLINK server. Without it, the SOCKS5 toggle has no destination and
- * requests just error out. We persist it but don't ship a default — the
- * project's SP isn't live yet (tracked for v2.5 in docs/nym-roadmap.md). */
-static QString   gNymSpAddress;
 
 static void applyTransport() {
-    switch (gTransport) {
-        case Transport::Tor: {
-            QByteArray a = ("socks=" + gTorProxy).toUtf8();
-            network_set_proxy(a.constData());
-            break;
-        }
-        case Transport::Nym: {
-            QByteArray a = ("socks=" + gNymProxy).toUtf8();
-            network_set_proxy(a.constData());
-            break;
-        }
-        case Transport::Direct:
-        default:
-            network_set_proxy(NULL);
-            break;
+    if (gTransport == Transport::Tor) {
+        QByteArray a = ("socks=" + gTorProxy).toUtf8();
+        network_set_proxy(a.constData());
+    } else {
+        network_set_proxy(NULL);
     }
 }
 
@@ -189,25 +164,20 @@ static void loadUserPrefs() {
     if (RegQueryValueExA(hk, "DisappearEnabled", NULL, NULL, (BYTE*)&val, &sz) == ERROR_SUCCESS) gDisappearEnabled = val != 0;
     if (RegQueryValueExA(hk, "DisappearSec",     NULL, NULL, (BYTE*)&val, &sz) == ERROR_SUCCESS) gDisappearSeconds = (int)val;
     if (RegQueryValueExA(hk, "RichText",         NULL, NULL, (BYTE*)&val, &sz) == ERROR_SUCCESS) gRichText = val != 0;
-    /* Transport selector (Direct / Tor / Nym). v2.3.0 only stored TorEnabled
-     * as a bool; honor that for back-compat, then let "Transport" override. */
+    /* Transport selector (Direct / Tor). v2.3.0 stored TorEnabled as a bool;
+     * v2.3.1 briefly added a Transport DWORD with a Nym value (removed in
+     * v2.3.2). Honor TorEnabled for back-compat, then accept Transport but
+     * clamp away any leftover value of 2 (Nym) to Direct. */
     if (RegQueryValueExA(hk, "TorEnabled", NULL, NULL, (BYTE*)&val, &sz) == ERROR_SUCCESS)
         gTransport = val ? Transport::Tor : Transport::Direct;
     if (RegQueryValueExA(hk, "Transport", NULL, NULL, (BYTE*)&val, &sz) == ERROR_SUCCESS) {
-        if (val <= 2) gTransport = static_cast<Transport>(val);
+        if (val == (DWORD)Transport::Tor)         gTransport = Transport::Tor;
+        else if (val == (DWORD)Transport::Direct) gTransport = Transport::Direct;
+        /* anything else (Nym=2 from v2.3.1) falls back to Direct */
     }
     char proxyBuf[128]; DWORD pssz = sizeof(proxyBuf);
-    pssz = sizeof(proxyBuf);
     if (RegQueryValueExA(hk, "TorProxy", NULL, NULL, (BYTE*)proxyBuf, &pssz) == ERROR_SUCCESS) {
         gTorProxy = QString::fromUtf8(proxyBuf);
-    }
-    pssz = sizeof(proxyBuf);
-    if (RegQueryValueExA(hk, "NymProxy", NULL, NULL, (BYTE*)proxyBuf, &pssz) == ERROR_SUCCESS) {
-        gNymProxy = QString::fromUtf8(proxyBuf);
-    }
-    char spBuf[512]; DWORD spsz = sizeof(spBuf);
-    if (RegQueryValueExA(hk, "NymSpAddress", NULL, NULL, (BYTE*)spBuf, &spsz) == ERROR_SUCCESS) {
-        gNymSpAddress = QString::fromUtf8(spBuf);
     }
     ssz = sizeof(str);
     if (RegQueryValueExA(hk, "ThemeName", NULL, NULL, (BYTE*)str, &ssz) == ERROR_SUCCESS) {
@@ -251,10 +221,9 @@ static void saveUserPrefs() {
     RegSetValueExA(hk, "TorEnabled", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
     QByteArray tp = gTorProxy.toUtf8();
     RegSetValueExA(hk, "TorProxy", 0, REG_SZ, (BYTE*)tp.constData(), tp.size() + 1);
-    QByteArray np = gNymProxy.toUtf8();
-    RegSetValueExA(hk, "NymProxy", 0, REG_SZ, (BYTE*)np.constData(), np.size() + 1);
-    QByteArray sp = gNymSpAddress.toUtf8();
-    RegSetValueExA(hk, "NymSpAddress", 0, REG_SZ, (BYTE*)sp.constData(), sp.size() + 1);
+    /* Best-effort cleanup of v2.3.1 Nym leftovers; ignore failures. */
+    RegDeleteValueA(hk, "NymProxy");
+    RegDeleteValueA(hk, "NymSpAddress");
     QByteArray nm = gTheme.name.toUtf8();
     RegSetValueExA(hk, "ThemeName", 0, REG_SZ, (BYTE*)nm.constData(), nm.size() + 1);
     auto saveColor = [&](const char *k, const QColor &c) {
@@ -563,7 +532,6 @@ private:
         QAction *ab = help->addAction("&About"); connect(ab, &QAction::triggered, [this]() {
             const char *tname =
                 gTransport == Transport::Tor ? "Tor (SOCKS5)" :
-                gTransport == Transport::Nym ? "Nym mixnet (SOCKS5)" :
                                                 "Direct (clearnet)";
             QMessageBox::about(this, "GHOSTLINK",
                 QString("GHOSTLINK v%1\n\nAES-256-GCM | ECDH P-384 | ML-KEM-1024\n"
@@ -2632,30 +2600,32 @@ private:
         tabs->addTab(ms, "Messages");
 
         /* ──────────── Network (transport) tab ────────────
-         * Mutually-exclusive radio group: Direct / Tor / Nym. The whole
-         * point of an exclusive selector is "no, you cannot run them
-         * stacked" — the threat models are different, the latency budgets
-         * are different, and stacking adds failure modes for no gain. */
+         * Mutually-exclusive radio group: Direct / Tor.
+         *
+         * GHOSTLINK's anonymity story is the *protocol*: end-to-end Double
+         * Ratchet encryption (server never sees plaintext), padded envelopes
+         * (server can't fingerprint by size), RSA-3072 blind-signature
+         * anonymous credentials (server rate-limits without tying actions to
+         * an identity), and no PII collection (a username is the only handle
+         * and the user picks it). This tab only covers the *network layer* —
+         * specifically, the IP↔username linkability that TLS-over-clearnet
+         * still leaves on the wire. Tor closes that one gap; everything else
+         * is already done at the protocol level whether Tor is on or off. */
         auto *nw = new QWidget; auto *nlv = new QVBoxLayout(nw);
 
         auto *tBox = new QGroupBox("Transport");
         auto *tLay = new QVBoxLayout(tBox);
         auto *rbDirect = new QRadioButton("Direct (clearnet)");
         auto *rbTor    = new QRadioButton("Tor (SOCKS5 → local tor daemon)");
-        auto *rbNym    = new QRadioButton("Nym mixnet (SOCKS5 → local nym-socks5-client)");
         rbDirect->setChecked(gTransport == Transport::Direct);
         rbTor->setChecked(gTransport == Transport::Tor);
-        rbNym->setChecked(gTransport == Transport::Nym);
         auto *bg = new QButtonGroup(tBox);
         bg->addButton(rbDirect, (int)Transport::Direct);
         bg->addButton(rbTor,    (int)Transport::Tor);
-        bg->addButton(rbNym,    (int)Transport::Nym);
         tLay->addWidget(rbDirect);
         tLay->addWidget(rbTor);
-        tLay->addWidget(rbNym);
         nlv->addWidget(tBox);
 
-        /* Tor-specific config row. */
         auto *torBox = new QGroupBox("Tor settings");
         auto *torLay = new QVBoxLayout(torBox);
         auto *torRow = new QHBoxLayout;
@@ -2675,54 +2645,17 @@ private:
         torLay->addWidget(torNote);
         nlv->addWidget(torBox);
 
-        /* Nym-specific config rows. */
-        auto *nymBox = new QGroupBox("Nym settings");
-        auto *nymLay = new QVBoxLayout(nymBox);
-        auto *nymRow = new QHBoxLayout;
-        nymRow->addWidget(new QLabel("SOCKS5 endpoint:"));
-        auto *nymEdit = new QLineEdit(gNymProxy);
-        nymEdit->setPlaceholderText("127.0.0.1:1080");
-        nymRow->addWidget(nymEdit, 1);
-        nymLay->addLayout(nymRow);
-        auto *spRow = new QHBoxLayout;
-        spRow->addWidget(new QLabel("Service Provider address:"));
-        auto *spEdit = new QLineEdit(gNymSpAddress);
-        spEdit->setPlaceholderText("<encryption_key>.<identity_key>@<gateway_identity>");
-        spRow->addWidget(spEdit, 1);
-        nymLay->addLayout(spRow);
-        auto *nymNote = new QLabel(
-            "Nym wraps every packet in fixed-size Sphinx, mixes through "
-            "Poisson-delayed hops, and emits cover traffic so the network "
-            "can't tell when you're sending. Latency is <b>1–3 seconds</b>; "
-            "this is by design. Requires <code>nym-socks5-client</code> "
-            "running locally and configured with the SP address shown above. "
-            "The GHOSTLINK project's own Service Provider isn't live yet "
-            "(tracked for v2.5) — this toggle is functional today only if you "
-            "run your own SP. See <code>docs/nym.md</code> for setup. "
-            "Mutually exclusive with Tor — only one transport runs at a time."
-        );
-        nymNote->setWordWrap(true);
-        nymNote->setTextFormat(Qt::RichText);
-        nymLay->addWidget(nymNote);
-        nlv->addWidget(nymBox);
-
-        /* Boxes stay enabled regardless of which radio is selected so the
-         * user can fill in values ahead of time, then flip the switch. */
-
         nlv->addStretch();
 
         auto syncTransport = [=]() {
             int id = bg->checkedId();
-            if (id >= 0 && id <= 2) gTransport = static_cast<Transport>(id);
+            if (id == (int)Transport::Tor) gTransport = Transport::Tor;
+            else                            gTransport = Transport::Direct;
             QString tp = torEdit->text().trimmed(); if (!tp.isEmpty()) gTorProxy = tp;
-            QString np = nymEdit->text().trimmed(); if (!np.isEmpty()) gNymProxy = np;
-            gNymSpAddress = spEdit->text().trimmed();
             applyTransport();
         };
         connect(bg, &QButtonGroup::idClicked, syncTransport);
         connect(torEdit, &QLineEdit::editingFinished, syncTransport);
-        connect(nymEdit, &QLineEdit::editingFinished, syncTransport);
-        connect(spEdit,  &QLineEdit::editingFinished, syncTransport);
         tabs->addTab(nw, "Network");
 
         /* ──────────── Devices (multi-device linking) tab ──────────── */

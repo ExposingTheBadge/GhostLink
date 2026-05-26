@@ -22,11 +22,6 @@ Tier 6 of the GHOSTLINK roadmap has shipped two pieces toward this:
 
 This document is the deployment guide for both halves.
 
-> **Looking for the Nym mixnet?** As of v2.3.1 the Windows client can also
-> route through Nym for traffic-analysis resistance beyond what Tor offers.
-> See `docs/nym.md`. The Settings → Network selector is **mutually exclusive**
-> — you pick Tor *or* Nym *or* clearnet, not a stack.
-
 ## Threat model
 
 Tor protects:
@@ -204,5 +199,3 @@ recovery still works even when onion-only is on.
   - **Bundled tor-client** so the Windows client can ship a turnkey
     onion-only build with no separate Tor install.
   - **Android Orbot integration** — tracked under v2.4.
-  - **Nym mixnet** as an alternative path with stronger metadata
-    properties — tracked under v2.5 (see `docs/nym-roadmap.md`).
