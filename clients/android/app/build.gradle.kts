@@ -11,8 +11,8 @@ android {
         applicationId = "com.ghostlink.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 18
-        versionName = "2.4.4"
+        versionCode = 19
+        versionName = "2.4.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -62,6 +62,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.activity:activity-compose:1.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-process:2.7.0")           // ProcessLifecycleOwner for PIN auto-lock
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.json:json:20231013")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")

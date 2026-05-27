@@ -647,6 +647,19 @@ def init_db():
     ):
         try: db.execute(ddl); db.commit()
         except: pass
+    # v2.4.5 — one-shot lowercase migration. Pre-v2.4.5 rows were stored
+    # case-sensitive; clients now normalize to lowercase before submitting
+    # credentials, so all stored usernames need to be lowercase too.
+    # Conflicts (Alice vs alice) keep the older row and drop the newer one;
+    # the user can re-register if they hit that edge case.
+    try:
+        db.execute(
+            "UPDATE users SET username = LOWER(username) "
+            "WHERE username <> LOWER(username) "
+            "AND LOWER(username) NOT IN (SELECT username FROM users)"
+        )
+        db.commit()
+    except: pass
     # One-time prekeys (consumed on each new conversation init)
     try:
         db.executescript("""
@@ -934,7 +947,7 @@ async def srp_register(request: Request):
     if setting_get("registration_enabled", "1") != "1":
         raise HTTPException(403, "Registration is currently disabled")
     body = await request.json()
-    username = (body.get("username") or "").strip()
+    username = norm_user(body.get("username") or "")
     if not username or len(username) < 3:
         raise HTTPException(400, "Username too short")
     try:
@@ -960,7 +973,7 @@ async def srp_challenge(request: Request):
     if not SRP_AVAILABLE:
         raise HTTPException(503, "SRP-6a unavailable")
     body = await request.json()
-    username = (body.get("username") or "").strip()
+    username = norm_user(body.get("username") or "")
     try:
         A = int(body["A_hex"], 16)
     except Exception:
@@ -1371,7 +1384,7 @@ async def encrypted_auth_v2(request: Request):
     except Exception:
         raise HTTPException(400, "Decryption failed")
 
-    username = payload.get("username", "")
+    username = norm_user(payload.get("username", ""))
     password = payload.get("password", "")
     device_name = payload.get("device_name", "")
     platform = payload.get("platform", "")
@@ -1499,9 +1512,10 @@ class ChangePasswordRequest(BaseModel):
 @app.post("/api/v1/change-password")
 async def change_password(req: ChangePasswordRequest):
     """Change user password. Requires current password verification."""
+    norm = norm_user(req.username)
     user = db.execute(
         "SELECT id, password_hash, password_salt FROM users WHERE username = ?",
-        (req.username,)
+        (norm,)
     ).fetchone()
     if not user:
         raise HTTPException(401, "Invalid credentials")
@@ -1528,7 +1542,7 @@ async def encrypted_auth(request: Request):
     payload = decrypt_auth_payload(
         body.get("session_id",""), body.get("client_public_key",""),
         body.get("nonce",""), body.get("ciphertext",""), body.get("tag",""))
-    username = payload.get("username","")
+    username = norm_user(payload.get("username",""))
     password = payload.get("password","")
     device_name = payload.get("device_name","")
     platform = payload.get("platform","")
@@ -1584,8 +1598,8 @@ async def encrypted_auth(request: Request):
 @app.post("/api/v1/register")
 async def register_user(req: RegisterUserRequest):
     """Register a new user. Returns user ID."""
-    # Check uniqueness
-    existing = db.execute("SELECT id FROM users WHERE username = ?", (req.username,)).fetchone()
+    norm = norm_user(req.username)
+    existing = db.execute("SELECT id FROM users WHERE username = ?", (norm,)).fetchone()
     if existing:
         raise HTTPException(409, "Username already registered")
 
@@ -1593,23 +1607,24 @@ async def register_user(req: RegisterUserRequest):
     key, salt = derive_key(req.password)
     db.execute(
         "INSERT INTO users (id, username, password_hash, password_salt) VALUES (?, ?, ?, ?)",
-        (user_id, req.username, key.hex(), salt)
+        (user_id, norm, key.hex(), salt)
     )
     db.commit()
-    return {"user_id": user_id, "username": req.username, "registered": True}
+    return {"user_id": user_id, "username": norm, "registered": True}
 
 # ── Device Registration ──────────────────────────────────────────────
 @app.post("/api/v1/devices")
 async def register_device(req: RegisterDeviceRequest):
     """Register a new device. Returns device ID, server's public key for ECDH."""
     # Auth user
-    print(f"[DEVICE REG] username={req.username} platform={req.platform} pw_len={len(req.password)} hwid={req.hwid[:16] if req.hwid else 'none'}")
+    norm = norm_user(req.username)
+    print(f"[DEVICE REG] username={norm} platform={req.platform} pw_len={len(req.password)} hwid={req.hwid[:16] if req.hwid else 'none'}")
     user = db.execute(
         "SELECT id, password_hash, password_salt FROM users WHERE username = ?",
-        (req.username,)
+        (norm,)
     ).fetchone()
     if not user:
-        print(f"[DEVICE REG] FAIL: username '{req.username}' not found")
+        print(f"[DEVICE REG] FAIL: username '{norm}' not found")
         raise HTTPException(401, "Invalid credentials")
 
     # Verify password
@@ -1953,7 +1968,7 @@ async def search_contacts(request: Request):
     """Exact-username lookup. Returns 0 or 1 user. Privacy: never enumerates."""
     body = await request.json()
     device_id = body.get("device_id", "")
-    query = (body.get("query", "") or "").strip()
+    query = norm_user(body.get("query", ""))
     user = auth_by_device(device_id)
     if not query or query == user[1]:
         return {"users": []}
@@ -1974,7 +1989,7 @@ class ContactDevRequest(BaseModel):
 @app.post("/api/v1/contacts/devices")
 async def get_contact_devices(req: ContactDevRequest):
     auth_by_device(req.device_id)
-    contact = db.execute("SELECT id FROM users WHERE username=?", (req.contact_username,)).fetchone()
+    contact = db.execute("SELECT id FROM users WHERE username=?", (norm_user(req.contact_username),)).fetchone()
     if not contact: raise HTTPException(404, "User not found")
     devices = db.execute("SELECT id, device_name, platform, public_key FROM devices WHERE user_id=?",
                          (contact[0],)).fetchall()
@@ -1992,7 +2007,7 @@ def _is_friends(user_a: str, user_b: str) -> bool:
 async def friend_request(request: Request):
     body = await request.json()
     me = auth_by_device(body.get("device_id", ""))
-    target_name = (body.get("target_username", "") or "").strip()
+    target_name = norm_user(body.get("target_username", ""))
     reason = (body.get("reason", "") or "")[:500]
     if not target_name or target_name == me[1]:
         raise HTTPException(400, "Invalid target")
@@ -2099,7 +2114,7 @@ async def group_invite(request: Request):
     body = await request.json()
     me = auth_by_device(body.get("device_id", ""))
     group_id = body.get("group_id", "")
-    target_name = (body.get("target_username", "") or "").strip()
+    target_name = norm_user(body.get("target_username", ""))
     reason = (body.get("reason", "") or "")[:500]
     if not target_name or target_name == me[1]:
         raise HTTPException(400, "Invalid target")
@@ -2490,6 +2505,14 @@ class OnionOnlyMiddleware(BaseHTTPMiddleware):
 app.add_middleware(OnionOnlyMiddleware)
 
 # ── Server settings (toggles) ────────────────────────────────────────
+# v2.4.5 — username normalization. The clients lowercase before submission,
+# but we ALSO lowercase server-side so any pre-v2.4.5 client (or a curl-er)
+# can't slip a mixed-case username through. Username storage was made
+# lower-only by the migration below at boot.
+def norm_user(u: str) -> str:
+    return (u or "").strip().lower()
+
+
 def setting_get(key: str, default: str = "") -> str:
     row = db.execute("SELECT value FROM server_settings WHERE key=?", (key,)).fetchone()
     return row[0] if row else default

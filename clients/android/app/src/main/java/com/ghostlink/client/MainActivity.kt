@@ -134,8 +134,34 @@ class MainActivity : ComponentActivity() {
         )
         setContent {
             val vm: GhostlinkVM = viewModel(factory = GhostlinkVM.Factory(application))
+
+            // Re-lock the app whenever the process goes to background
+            // (also fires on screen-off if the app is foregrounded). The
+            // observer is bound to the process lifecycle so it survives
+            // configuration changes.
+            DisposableEffect(Unit) {
+                val owner = androidx.lifecycle.ProcessLifecycleOwner.get()
+                val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                    if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) vm.lock()
+                }
+                owner.lifecycle.addObserver(obs)
+                onDispose { owner.lifecycle.removeObserver(obs) }
+            }
+            // 60-second inactivity timer. Runs only while unlocked.
+            LaunchedEffect(vm.isRegistered, vm.pinLocked) {
+                while (vm.isRegistered && !vm.pinLocked) {
+                    kotlinx.coroutines.delay(5_000)
+                    if (vm.inactivityExpired()) vm.lock()
+                }
+            }
+
             MaterialTheme(colorScheme = colorSchemeFor(vm.themeName)) {
-                if (vm.isRegistered) ChatScreen(vm) else AuthScreen(vm)
+                when {
+                    !vm.isRegistered             -> AuthScreen(vm)
+                    vm.pinHash == null           -> PinSetupScreen(vm)
+                    vm.pinLocked                 -> PinUnlockScreen(vm)
+                    else                         -> ChatScreen(vm)
+                }
             }
         }
     }
@@ -162,7 +188,80 @@ class GhostlinkVM(application: Application) : AndroidViewModel(application) {
     var disappearEnabled by mutableStateOf(false)
     var disappearSeconds by mutableStateOf(60)
     /** Theme persisted in prefs. Names match the Windows presets. */
-    var themeName by mutableStateOf("GHOSTLINK Dark")
+    var themeName by mutableStateOf("Nord")
+
+    /* ── PIN lock (v2.4.5) ───────────────────────────────────────────
+     * Mandatory PIN, set on first launch after auth. Screen-off and a
+     * 60-second inactivity window relock the app; 3 wrong unlock
+     * attempts wipe the session and bounce back to the login screen.
+     *
+     * Stored as PBKDF2-HMAC-SHA256(pin, salt, 60000 iter, 256 bits) so
+     * an attacker who steals the prefs file still has to brute-force
+     * the PIN — but PINs are short by definition so this is best-effort
+     * defense-in-depth on top of EncryptedSharedPreferences.       */
+    var pinHash by mutableStateOf<String?>(null)   // "iter:salt_hex:hash_hex"
+    var pinLocked by mutableStateOf(false)
+    var pinFailCount by mutableStateOf(0)
+    private var lastInteractionMs = System.currentTimeMillis()
+
+    /** Called by ChatScreen on every user gesture to keep the app
+     *  unlocked. Also resets the auto-lock timer. */
+    fun touch() { lastInteractionMs = System.currentTimeMillis() }
+
+    /** Returns true if the auto-lock window has expired. Called by the
+     *  ticker that runs alongside the heartbeat. */
+    fun inactivityExpired(windowMs: Long = 60_000L): Boolean =
+        System.currentTimeMillis() - lastInteractionMs > windowMs
+
+    /** Called from the lifecycle observer when the app goes to
+     *  background (screen-off, switch app, etc.). */
+    fun lock() { if (pinHash != null) pinLocked = true }
+
+    /** Hash a PIN with PBKDF2. Returns "iter:salt_hex:hash_hex". */
+    private fun hashPin(pin: String, saltHex: String? = null, iter: Int = 60_000): String {
+        val salt = saltHex?.hexToBytes() ?: java.security.SecureRandom().run {
+            val b = ByteArray(16); nextBytes(b); b
+        }
+        val spec = javax.crypto.spec.PBEKeySpec(pin.toCharArray(), salt, iter, 256)
+        val skf  = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val key  = skf.generateSecret(spec).encoded
+        return "$iter:${salt.toHex()}:${key.toHex()}"
+    }
+
+    fun setPin(pin: String) {
+        val h = hashPin(pin)
+        pinHash = h
+        pinFailCount = 0
+        pinLocked = false
+        prefs.edit().putString("pin_hash", h).putInt("pin_fail", 0).apply()
+    }
+
+    /** Try to unlock with the supplied pin. Returns true on success.
+     *  After 3 failed attempts in a row, the entire session is wiped. */
+    fun tryUnlock(pin: String): Boolean {
+        val saved = pinHash ?: return true
+        val parts = saved.split(":")
+        if (parts.size != 3) return false
+        val iter = parts[0].toIntOrNull() ?: return false
+        val attempt = hashPin(pin, saltHex = parts[1], iter = iter)
+        if (attempt == saved) {
+            pinFailCount = 0
+            pinLocked = false
+            prefs.edit().putInt("pin_fail", 0).apply()
+            touch()
+            return true
+        }
+        pinFailCount += 1
+        prefs.edit().putInt("pin_fail", pinFailCount).apply()
+        if (pinFailCount >= 3) {
+            // Out — wipe local session state and force a fresh login.
+            isRegistered = false
+            deviceID = ""; username = ""; savedPassword = ""
+            pinHash = null; pinFailCount = 0; pinLocked = false
+            prefs.edit().clear().apply()
+        }
+        return false
+    }
 
     /* Persistence helpers — the Settings dialog calls these so the
      * choice survives process death. */
@@ -208,7 +307,13 @@ class GhostlinkVM(application: Application) : AndroidViewModel(application) {
         // these lines — see below).
         disappearEnabled = prefs.getBoolean("disappear_enabled", false)
         disappearSeconds = prefs.getInt("disappear_secs", 60)
-        themeName = prefs.getString("theme_name", "GHOSTLINK Dark") ?: "GHOSTLINK Dark"
+        themeName = prefs.getString("theme_name", "Nord") ?: "Nord"
+        pinHash = prefs.getString("pin_hash", null)
+        pinFailCount = prefs.getInt("pin_fail", 0)
+        // Always start LOCKED if a PIN was previously set, so an attacker
+        // grabbing the unlocked phone can't open the chat by tapping the
+        // launcher icon.
+        pinLocked = pinHash != null
 
         val sid = prefs.getString("device_id", "") ?: ""
         val su = prefs.getString("username", "") ?: ""
@@ -462,7 +567,11 @@ class GhostlinkVM(application: Application) : AndroidViewModel(application) {
         } catch (_: Throwable) { null }
     }
 
-    fun auth(u: String, p: String, d: String, isReg: Boolean, onError: (String) -> Unit) {
+    fun auth(uIn: String, p: String, d: String, isReg: Boolean, onError: (String) -> Unit) {
+        // v2.4.5 — usernames are case-insensitive end-to-end. Lowercase before
+        // hashing/encrypting so the server's normalize step matches what we
+        // computed locally, regardless of what the user typed.
+        val u = uIn.trim().lowercase()
         viewModelScope.launch {
             try {
                 // 0. Verify the server's long-term identity fingerprint (TOFU).
@@ -697,9 +806,11 @@ class GhostlinkVM(application: Application) : AndroidViewModel(application) {
     }
 
     fun search(q: String) {
+        // Lowercase server-side match — keep client behaviour consistent.
+        val query = q.trim().lowercase()
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val r = NetworkClient.post("/api/v1/contacts/search", JSONObject().apply { put("device_id",deviceID); put("query",q) })
+                val r = NetworkClient.post("/api/v1/contacts/search", JSONObject().apply { put("device_id",deviceID); put("query",query) })
                 val arr = r.optJSONArray("users"); val l = mutableListOf<String>()
                 if (arr != null) for (i in 0 until arr.length()) l.add(arr.getString(i))
                 sideList = l
@@ -860,6 +971,149 @@ data class Msg(
     val name: String? = null,        // sender display name
 )
 
+/**
+ * PIN setup — mandatory on first launch after auth (no skip path).
+ * 4+ digits, confirm. Stores PBKDF2 hash in EncryptedSharedPreferences.
+ */
+@Composable
+fun PinSetupScreen(vm: GhostlinkVM) {
+    var p1 by remember { mutableStateOf("") }
+    var p2 by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf<String?>(null) }
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally,
+               modifier = Modifier.padding(24.dp).fillMaxWidth(0.9f)) {
+            Text("Set an app PIN",
+                style = MaterialTheme.typography.headlineSmall,
+                color = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(8.dp))
+            Text("4+ digits. You'll re-enter this whenever the screen turns " +
+                 "off or the app sits idle. 3 wrong attempts log you out.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            Spacer(Modifier.height(16.dp))
+            OutlinedTextField(
+                value = p1, onValueChange = { p1 = it.filter(Char::isDigit) },
+                label = { Text("PIN") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = p2, onValueChange = { p2 = it.filter(Char::isDigit) },
+                label = { Text("Confirm PIN") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+            )
+            if (err != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(err!!, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+            }
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = {
+                    when {
+                        p1.length < 4 -> err = "PIN must be at least 4 digits"
+                        p1 != p2      -> err = "PINs don't match"
+                        else          -> { vm.setPin(p1); err = null }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Save PIN") }
+        }
+    }
+}
+
+/**
+ * PIN unlock screen — shown on app resume / inactivity timeout. 3 wrong
+ * attempts call vm.tryUnlock which wipes the session on the third miss.
+ */
+@Composable
+fun PinUnlockScreen(vm: GhostlinkVM) {
+    var pin by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf<String?>(null) }
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally,
+               modifier = Modifier.padding(24.dp).fillMaxWidth(0.9f)) {
+            Icon(Icons.Filled.Lock, "Locked",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(48.dp))
+            Spacer(Modifier.height(12.dp))
+            Text("Enter PIN to unlock",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface)
+            Spacer(Modifier.height(16.dp))
+            OutlinedTextField(
+                value = pin,
+                onValueChange = {
+                    pin = it.filter(Char::isDigit)
+                    err = null
+                },
+                label = { Text("PIN") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (err != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(err!!, color = MaterialTheme.colorScheme.error, fontSize = 12.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth())
+            }
+            Text("Wrong attempts: ${vm.pinFailCount} / 3",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = {
+                    if (!vm.tryUnlock(pin)) {
+                        err = "Wrong PIN"
+                        pin = ""
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Unlock") }
+        }
+    }
+}
+
+/**
+ * IconButton with a long-press tooltip ("hover description"). Mirrors the
+ * Windows Qt toolTip behaviour. On Android, accessibility services (e.g.
+ * TalkBack) read the tip via `contentDescription`, and the platform's
+ * built-in long-press content-description tooltip surfaces it visually
+ * for sighted users without a mouse.
+ *
+ * We intentionally don't use Material 3's TooltipBox/PlainTooltip here:
+ * those are gated behind ExperimentalMaterial3Api and weren't promoted
+ * out of `private` until material3 1.2.0. This project pins Compose BOM
+ * 2024.01.00 (material3 1.1.2), so we use the stable contentDescription
+ * path — which Android already turns into a tooltip on long-press.
+ */
+@Composable
+fun TooltipIconButton(
+    tip: String,
+    onClick: () -> Unit,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    contentDesc: String,
+    enabled: Boolean = true,
+) {
+    // Concatenate the short contentDescription and the longer tip so
+    // accessibility services announce the full intent. Android shows the
+    // contentDescription as a long-press tooltip on API 26+.
+    val merged = if (contentDesc.isBlank() || tip == contentDesc) tip
+                 else "$contentDesc — $tip"
+    IconButton(onClick = onClick, enabled = enabled) {
+        Icon(icon, contentDescription = merged)
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AuthScreen(vm: GhostlinkVM) {
@@ -996,27 +1250,53 @@ fun ChatScreen(vm: GhostlinkVM) {
         )
     }
 
+    // v2.4.5 — switched from GetContent() to PickVisualMedia(): the
+    // legacy content picker requires READ_MEDIA_IMAGES on Android 13+
+    // and was silently no-op'ing on some devices. PickVisualMedia is
+    // the modern photo-picker that needs no runtime permission.
     val pickImage = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) vm.sendImage(uri)
     }
+    val ctxLocal = androidx.compose.ui.platform.LocalContext.current
 
     LaunchedEffect(Unit) { vm.ownDevices() }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("GHOSTLINK", color = MaterialTheme.colorScheme.primary) },
+                // v2.4.5 — title removed per user request; signed-in username
+                // remains in the trailing actions row so people know which
+                // account they're using.
+                title = { },
                 actions = {
                     Text(vm.username, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    IconButton(
+                    TooltipIconButton(
+                        tip = "Verify safety number with this contact",
                         onClick = { vm.computeSafetyNumber { fp -> safetyNumber = fp } },
                         enabled = vm.selectedRecipient.isNotBlank(),
-                    ) { Icon(Icons.Filled.Lock, "Verify safety number") }
-                    IconButton(onClick = { vm.ownDevices(); tab = 0; showSide = true }) { Icon(Icons.Filled.Search, "Contacts") }
-                    IconButton(onClick = { vm.loadGroups(); tab = 2; showSide = true }) { Icon(Icons.Filled.Share, "Groups") }
-                    IconButton(onClick = { showSettings = true }) { Icon(Icons.Filled.Settings, "Settings") }
+                        icon = Icons.Filled.Lock,
+                        contentDesc = "Verify safety number",
+                    )
+                    TooltipIconButton(
+                        tip = "Search and pick a contact",
+                        onClick = { vm.ownDevices(); tab = 0; showSide = true },
+                        icon = Icons.Filled.Search,
+                        contentDesc = "Contacts",
+                    )
+                    TooltipIconButton(
+                        tip = "Open groups",
+                        onClick = { vm.loadGroups(); tab = 2; showSide = true },
+                        icon = Icons.Filled.Share,
+                        contentDesc = "Groups",
+                    )
+                    TooltipIconButton(
+                        tip = "App settings",
+                        onClick = { showSettings = true },
+                        icon = Icons.Filled.Settings,
+                        contentDesc = "Settings",
+                    )
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
             )
@@ -1045,9 +1325,20 @@ fun ChatScreen(vm: GhostlinkVM) {
                 Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 3.dp) {
                     Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(
-                            onClick = { pickImage.launch("image/*") },
-                            // Disabled during maintenance.
-                            enabled = vm.selectedRecipient.isNotBlank() && !vm.maintenanceMode,
+                            onClick = {
+                                if (vm.selectedRecipient.isBlank()) {
+                                    android.widget.Toast.makeText(
+                                        ctxLocal, "Pick a contact first", android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    pickImage.launch(
+                                        androidx.activity.result.PickVisualMediaRequest(
+                                            ActivityResultContracts.PickVisualMedia.ImageOnly
+                                        )
+                                    )
+                                }
+                            },
+                            enabled = !vm.maintenanceMode,
                         ) { Icon(Icons.Filled.Add, "Attach image", tint = MaterialTheme.colorScheme.primary) }
                         // 3x taller multi-line input matching the Windows v2.4.1
                         // 108px bump. minLines=3 gives ~3 lines of visible text;
@@ -1290,12 +1581,26 @@ fun SettingsDialog(vm: GhostlinkVM, onDismiss: () -> Unit, onLinkDevice: () -> U
         title = { Text("Settings") },
         text = {
             Column(Modifier.fillMaxWidth().heightIn(min = 380.dp, max = 560.dp)) {
-                androidx.compose.material3.TabRow(selectedTabIndex = tab) {
+                // v2.4.5 — TabRow can squeeze tab labels until they wrap
+                // character-by-character (looks like vertical text). Fix:
+                // ScrollableTabRow gives each tab its natural width; the
+                // Text() inside uses maxLines=1 + softWrap=false as a belt.
+                androidx.compose.material3.ScrollableTabRow(
+                    selectedTabIndex = tab,
+                    edgePadding = 0.dp,
+                ) {
                     tabs.forEachIndexed { i, label ->
                         androidx.compose.material3.Tab(
                             selected = tab == i,
                             onClick = { tab = i },
-                            text = { Text(label, fontSize = 12.sp) },
+                            text = {
+                                Text(
+                                    label,
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                )
+                            },
                         )
                     }
                 }
