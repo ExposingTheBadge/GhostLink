@@ -60,7 +60,11 @@ function getCookie(name) {
   return m ? decodeURIComponent(m[1]) : '';
 }
 
-/* ─── HTTP with CSRF on writes ────────────────────────────────────── */
+/* ─── HTTP with CSRF on writes ──────────────────────────────────────
+ *  Writes echo the ghostlink_csrf cookie back as X-CSRF-Token
+ *  (double-submit). Any non-2xx response is thrown so the caller can
+ *  show an honest failure toast — silently treating 403/503 as success
+ *  is what made the v2.4.0 maintenance toggle appear to do nothing. */
 async function api(method, path, body) {
   const opts = { method, headers: {} };
   if (method !== 'GET') {
@@ -73,6 +77,14 @@ async function api(method, path, body) {
   }
   const r = await fetch(path, opts);
   if (r.status === 401) { location = '/admin/login'; throw new Error('unauthorized'); }
+  if (!r.ok) {
+    let detail = r.status + ' ' + r.statusText;
+    try {
+      const j = await r.clone().json();
+      if (j && j.detail) detail = j.detail;
+    } catch (_) { /* response wasn't JSON */ }
+    throw new Error(detail);
+  }
   return r;
 }
 
@@ -648,11 +660,20 @@ async function ctrlConfirm(action, title, plainBody, impactClass) {
 }
 async function toggleSetting(which, enabled) {
   try {
-    await api('POST', '/api/v1/admin/control/' + which, { enabled });
-    toast(which + ' = ' + (enabled ? 'on' : 'off'), 'ok');
-    refresh();
+    const r = await api('POST', '/api/v1/admin/control/' + which, { enabled });
+    const j = await r.json().catch(() => ({}));
+    // Read back the server's reported state so the toast can't lie when
+    // the persistence step didn't happen. Different endpoints use
+    // slightly different keys; check the obvious ones in order.
+    const key = which === 'onion-only' ? 'onion_only'
+              : which === 'maintenance' ? 'maintenance_mode'
+              : which === 'registration' ? 'registration_enabled'
+              : null;
+    const actual = key && key in j ? !!j[key] : enabled;
+    toast(which + ' = ' + (actual ? 'on' : 'off'), 'ok');
+    await refresh();
   } catch (e) {
-    toast(which + ' failed', 'danger');
+    toast(which + ' failed: ' + (e && e.message ? e.message : 'unknown'), 'danger');
   }
 }
 function copyFp() {

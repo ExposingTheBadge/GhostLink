@@ -11,8 +11,8 @@ android {
         applicationId = "com.ghostlink.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 14
-        versionName = "2.4.0"
+        versionCode = 15
+        versionName = "2.4.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

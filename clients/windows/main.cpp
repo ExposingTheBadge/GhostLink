@@ -6,7 +6,7 @@
 #include <QtNetwork>
 #include <QtCore>
 
-#define CLIENT_VERSION "2.4.0"
+#define CLIENT_VERSION "2.4.1"
 
 extern "C" {
 #include "client.h"
@@ -440,9 +440,40 @@ private:
     QPushButton *m_sendBtn, *m_attachBtn;
     QLabel *m_statusBar;
     bool m_registered = false, m_tabGroups = false;
+    bool m_maintenanceMode = false;   // server-wide; set from heartbeat + send 503s
     QString m_deviceId, m_username, m_deviceName, m_platform, m_password;
     QString m_selectedRecip;
     QStringList m_friends;
+    QLabel *m_maintenanceBanner = nullptr;
+
+    /* Single source of truth for whether the server is in maintenance.
+     * Called from the heartbeat poll and from any send-attempt that
+     * gets a 503. Flips the banner, disables the send button + input,
+     * and reverts everything when maintenance ends. */
+    void setMaintenanceMode(bool on) {
+        if (on == m_maintenanceMode && m_maintenanceBanner) {
+            /* Idempotent — but always re-apply the visible flag in case the
+             * banner widget was rebuilt by buildChatUI(). */
+            if (m_maintenanceBanner) m_maintenanceBanner->setVisible(on);
+            if (m_msgInput) m_msgInput->setEnabled(!on);
+            if (m_sendBtn)  m_sendBtn->setEnabled(!on);
+            if (m_attachBtn) m_attachBtn->setEnabled(!on);
+            return;
+        }
+        m_maintenanceMode = on;
+        if (m_maintenanceBanner) m_maintenanceBanner->setVisible(on);
+        if (m_msgInput) {
+            m_msgInput->setEnabled(!on);
+            m_msgInput->setPlaceholderText(on
+                ? "Server in maintenance — messaging disabled for security"
+                : "Type a message...  (Win + . for emoji)");
+            m_msgInput->setStyleSheet(on
+                ? "QLineEdit { background: #2a0a0a; color: #ff8a8a; border: 2px solid #b00020; }"
+                : "");
+        }
+        if (m_sendBtn)  m_sendBtn->setEnabled(!on);
+        if (m_attachBtn) m_attachBtn->setEnabled(!on);
+    }
 
     /* Search result panel widgets — built once in buildChatUI, shown when a
        lookup hits or misses. */
@@ -952,7 +983,7 @@ private:
         });
         inputRow->addWidget(emojiBtnIn);
         m_msgInput = new QLineEdit; m_msgInput->setPlaceholderText("Type a message...  (Win + . for emoji)");
-        m_msgInput->setMinimumHeight(36);
+        m_msgInput->setMinimumHeight(108);   /* 3x the old 36px per v2.4.1 ask */
         /* Force a font with emoji glyphs as fallback so 🎯 etc render in-place. */
         {
             QFont f = m_msgInput->font();
@@ -961,6 +992,20 @@ private:
         }
         inputRow->addWidget(m_msgInput, 1);
         m_sendBtn = new QPushButton("Send"); inputRow->addWidget(m_sendBtn);
+
+        /* Maintenance banner — shown ONLY when the server has flipped the
+         * maintenance_mode flag. Sits just above the input row in red so
+         * the user can't miss it. setMaintenanceMode() handles all the
+         * styling + send-button disabling in one place. */
+        m_maintenanceBanner = new QLabel(
+            "Server is undergoing maintenance — messaging is disabled for security.");
+        m_maintenanceBanner->setAlignment(Qt::AlignCenter);
+        m_maintenanceBanner->setStyleSheet(
+            "QLabel { background: #b00020; color: #ffffff; padding: 6px 10px; "
+            "border-radius: 4px; font-weight: 600; }");
+        m_maintenanceBanner->setVisible(false);
+        cl->addWidget(m_maintenanceBanner);
+
         cl->addLayout(inputRow);
 
         hbox->addWidget(chatArea, 1);
@@ -1017,13 +1062,26 @@ private:
         connect(timer, &QTimer::timeout, this, [this]() {
             fetchMessages();
             if (!m_deviceId.isEmpty()) {
-                httpPost("/api/v1/heartbeat", jsonBody({{"device_id", m_deviceId}}));
+                QByteArray hb = httpPost("/api/v1/heartbeat",
+                    jsonBody({{"device_id", m_deviceId}}));
+                /* Server includes "maintenance_mode": true/false on every
+                 * successful beat. Mirror it into the UI so the input
+                 * box flips red the moment the admin toggles it on, no
+                 * send-attempt required. */
+                if (!hb.isEmpty()) {
+                    setMaintenanceMode(hb.contains("\"maintenance_mode\":true"));
+                }
             }
             /* Health check */
             QByteArray hr = httpGet("/health");
             if (!hr.isEmpty() && hr.contains("\"status\":\"ok\"")) {
-                m_statusBar->setText("Online — AES-256-GCM | ECDH P-384");
-                m_statusBar->setStyleSheet("color: #2ed573; font-size: 11px; font-weight: bold;");
+                if (m_maintenanceMode) {
+                    m_statusBar->setText("Server in maintenance — sending disabled");
+                    m_statusBar->setStyleSheet("color: #ff8a8a; font-size: 11px; font-weight: bold;");
+                } else {
+                    m_statusBar->setText("Online — AES-256-GCM | ECDH P-384");
+                    m_statusBar->setStyleSheet("color: #2ed573; font-size: 11px; font-weight: bold;");
+                }
             } else {
                 m_statusBar->setText("Server offline");
                 m_statusBar->setStyleSheet("color: #ff4757; font-size: 11px; font-weight: bold;");
@@ -2035,7 +2093,16 @@ private:
         if (gDisappearEnabled && gDisappearSeconds > 0) {
             expHdr = QByteArray("X-Expires-In: ") + QByteArray::number(gDisappearSeconds);
         }
-        httpPost("/api/v1/messages/send", jb, expHdr);
+        QByteArray sendResp = httpPost("/api/v1/messages/send", jb, expHdr);
+        /* Fast-path: server gates sends behind setting_get("maintenance_mode")
+         * and replies 503 {"detail":"maintenance"}. Catch it here so the UI
+         * flips red even if the heartbeat poll hasn't fired yet. */
+        if (sendResp.contains("\"detail\":\"maintenance\"")) {
+            setMaintenanceMode(true);
+            m_statusBar->setText("Send refused — server in maintenance");
+            m_statusBar->setStyleSheet("color: #ff8a8a; font-size: 11px; font-weight: bold;");
+            return;
+        }
 
         m_chatLog->append(QString("<b>[%1]</b> %2")
             .arg(m_username.toHtmlEscaped(), mdToHtml(body)));
@@ -2229,7 +2296,13 @@ private:
         if (gDisappearEnabled && gDisappearSeconds > 0) {
             expHdr2 = QByteArray("X-Expires-In: ") + QByteArray::number(gDisappearSeconds);
         }
-        httpPost("/api/v1/messages/send", jb, expHdr2);
+        QByteArray imgResp = httpPost("/api/v1/messages/send", jb, expHdr2);
+        if (imgResp.contains("\"detail\":\"maintenance\"")) {
+            setMaintenanceMode(true);
+            m_statusBar->setText("Upload refused — server in maintenance");
+            m_statusBar->setStyleSheet("color: #ff8a8a; font-size: 11px; font-weight: bold;");
+            return;
+        }
 
         if (isImage && !localPath.isEmpty()) {
             insertImageBubble(fileId, localPath, m_username);

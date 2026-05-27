@@ -1477,12 +1477,18 @@ async def get_version():
 
 @app.post("/api/v1/heartbeat")
 async def heartbeat(req: GetMessagesRequest):
-    """Client heartbeat — keeps last_seen fresh for active client tracking."""
+    """Client heartbeat — keeps last_seen fresh for active client tracking.
+    Also surfaces server-wide flags clients need to react to (currently
+    just maintenance_mode), so the UI can flip into a disabled state
+    without waiting for a send to 503."""
     device = db.execute("SELECT id FROM devices WHERE id = ?", (req.device_id,)).fetchone()
     if device:
         db.execute("UPDATE devices SET last_seen = datetime('now') WHERE id = ?", (req.device_id,))
         db.commit()
-        return {"beat": "ok"}
+        return {
+            "beat": "ok",
+            "maintenance_mode": setting_get("maintenance_mode", "0") == "1",
+        }
     raise HTTPException(404, "Device not found")
 
 class ChangePasswordRequest(BaseModel):
@@ -1669,6 +1675,20 @@ async def register_device(req: RegisterDeviceRequest):
         "registered": True
     }
 
+# ── Maintenance-mode gate ─────────────────────────────────────────
+# When the operator toggles maintenance on, every outbound message and
+# every file upload is refused. Clients see HTTP 503 with a stable
+# "detail": "maintenance" payload + an X-Maintenance: 1 header so they
+# can detect it cheaply on every send attempt.
+def _guard_maintenance():
+    if setting_get("maintenance_mode", "0") == "1":
+        raise HTTPException(
+            status_code=503,
+            detail="maintenance",
+            headers={"X-Maintenance": "1", "Retry-After": "60"},
+        )
+
+
 # ── Send Message ─────────────────────────────────────────────────────
 @app.post("/api/v1/messages/send")
 async def send_message(request: Request):
@@ -1679,6 +1699,7 @@ async def send_message(request: Request):
       X-Envelope-Version: 2     Marks v2 envelopes (size MUST hit a padding bucket).
     Body is the SendMessageRequest (sender_device_id, recipient_device_id, envelope).
     """
+    _guard_maintenance()
     body = await request.json()
     sender_id = body.get("sender_device_id", "")
     recipient_id = body.get("recipient_device_id", "")
@@ -1829,6 +1850,7 @@ async def send_sealed_message(request: Request):
       X-Envelope-Version: 2            optional (v2 envelopes must be padded)
     Body: raw bytes of the sealed envelope (any format the clients agree on).
     """
+    _guard_maintenance()
     recipient_id = request.headers.get("X-Recipient-ID", "")
     expires_in = request.headers.get("X-Expires-In", "")
     env_ver = int(request.headers.get("X-Envelope-Version", "2") or 2)
@@ -2195,6 +2217,7 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
 @app.post("/api/v1/files/upload")
 async def upload_file(request: Request):
     """Streaming upload — server stores encrypted blob, never sees plaintext."""
+    _guard_maintenance()
     sender_id = request.headers.get("X-Device-ID", "")
     recipient_id = request.headers.get("X-Recipient-ID", "")
     encrypted_metadata = request.headers.get("X-File-Metadata", "{}")
@@ -2643,7 +2666,11 @@ async def admin_fingerprint_login(request: Request):
 
     resp = JSONResponse({"ok": True, "session_id": sid})
     resp.set_cookie(key="ghostlink_sid", value=sid, httponly=True, samesite="lax", max_age=SESSION_TIMEOUT_SEC, path="/")
-    resp.set_cookie(key="ghostlink_csrf", value=csrf, httponly=True, samesite="lax", max_age=SESSION_TIMEOUT_SEC, path="/")
+    # Double-submit CSRF: the cookie MUST be readable by JS so admin.js
+    # can echo it as X-CSRF-Token on writes. Same-origin policy keeps
+    # other sites from reading it. httponly=True here was the v2.4.0
+    # bug that broke every admin toggle — JS got "" and POSTs 403'd.
+    resp.set_cookie(key="ghostlink_csrf", value=csrf, httponly=False, samesite="strict", max_age=SESSION_TIMEOUT_SEC, path="/")
     return resp
 
 @app.post("/api/v1/admin/setup")
