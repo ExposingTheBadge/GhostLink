@@ -55,6 +55,51 @@ object Ratchet {
         var nr: Int = 0
         var pn: Int = 0
         val skipped: MutableList<SkippedKey> = mutableListOf()
+
+        /** Versioned blob layout for on-disk persistence. JSON-encoded for
+         *  forward-compatibility — the Windows port uses fixed-size struct
+         *  layout but Kotlin doesn't have that natural memcpy path, and JSON
+         *  is robust under skipped-key growth. */
+        fun toBytes(): ByteArray {
+            val o = org.json.JSONObject()
+            o.put("v", 1)
+            o.put("rk", rk.toHex())
+            o.put("cks", cks?.toHex() ?: org.json.JSONObject.NULL)
+            o.put("ckr", ckr?.toHex() ?: org.json.JSONObject.NULL)
+            o.put("dhsPriv", dhsPriv.toHex())
+            o.put("dhsPub",  dhsPub.toHex())
+            o.put("dhrPub",  dhrPub?.toHex() ?: org.json.JSONObject.NULL)
+            o.put("ns", ns); o.put("nr", nr); o.put("pn", pn)
+            val arr = org.json.JSONArray()
+            for (sk in skipped) {
+                arr.put(org.json.JSONObject().apply {
+                    put("dhr", sk.dhrPub.toHex()); put("n", sk.n); put("mk", sk.mk.toHex())
+                })
+            }
+            o.put("skipped", arr)
+            return o.toString().toByteArray()
+        }
+
+        companion object {
+            fun fromBytes(bs: ByteArray): State? = try {
+                val o = org.json.JSONObject(String(bs))
+                val st = State()
+                st.rk = o.getString("rk").hexToBytes()
+                st.cks = if (o.isNull("cks")) null else o.getString("cks").hexToBytes()
+                st.ckr = if (o.isNull("ckr")) null else o.getString("ckr").hexToBytes()
+                st.dhsPriv = o.getString("dhsPriv").hexToBytes()
+                st.dhsPub  = o.getString("dhsPub").hexToBytes()
+                st.dhrPub  = if (o.isNull("dhrPub")) null else o.getString("dhrPub").hexToBytes()
+                st.ns = o.getInt("ns"); st.nr = o.getInt("nr"); st.pn = o.getInt("pn")
+                val arr = o.optJSONArray("skipped")
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val s = arr.getJSONObject(i)
+                    st.skipped += SkippedKey(s.getString("dhr").hexToBytes(),
+                        s.getInt("n"), s.getString("mk").hexToBytes())
+                }
+                st
+            } catch (_: Throwable) { null }
+        }
     }
 
     // ── X25519 ───────────────────────────────────────────────────────
@@ -142,6 +187,43 @@ object Ratchet {
         c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
         c.updateAAD(aad)
         return c.doFinal(ctTag)
+    }
+
+    // ── X3DH ─────────────────────────────────────────────────────────
+    // Mirrors clients/windows/ratchet.c:ratchet_x3dh_{alice,bob}.
+    // SK = HKDF-SHA512(0, F || DH1 || DH2 [|| DH3 || DH4], "GHOSTLINK-X3DH-v1")
+    // where F = 32 bytes 0xFF (domain-separation prefix).
+    private val X3DH_INFO = "GHOSTLINK-X3DH-v1".toByteArray()
+
+    fun x3dhAlice(myIkPriv: ByteArray, myEkPriv: ByteArray,
+                  peerIkPub: ByteArray, peerOpkPub: ByteArray?): ByteArray {
+        val ff = ByteArray(32) { 0xFF.toByte() }
+        val dh1 = x25519Dh(myIkPriv, peerIkPub)   // DH1
+        val dh2 = x25519Dh(myEkPriv, peerIkPub)   // DH2
+        val km = if (peerOpkPub != null) {
+            val dh3 = x25519Dh(myEkPriv, peerOpkPub)
+            val dh4 = x25519Dh(myIkPriv, peerOpkPub)
+            ff + dh1 + dh2 + dh3 + dh4
+        } else {
+            ff + dh1 + dh2
+        }
+        return hkdfSha512(ByteArray(64), km, X3DH_INFO, 32)
+    }
+
+    fun x3dhBob(myIkPriv: ByteArray, myOpkPriv: ByteArray?,
+                peerIkPub: ByteArray, peerEkPub: ByteArray): ByteArray {
+        val ff = ByteArray(32) { 0xFF.toByte() }
+        // ECDH symmetry: swapped private/public produce the same shared.
+        val dh1 = x25519Dh(myIkPriv, peerIkPub)
+        val dh2 = x25519Dh(myIkPriv, peerEkPub)
+        val km = if (myOpkPriv != null) {
+            val dh3 = x25519Dh(myOpkPriv, peerEkPub)
+            val dh4 = x25519Dh(myOpkPriv, peerIkPub)
+            ff + dh1 + dh2 + dh3 + dh4
+        } else {
+            ff + dh1 + dh2
+        }
+        return hkdfSha512(ByteArray(64), km, X3DH_INFO, 32)
     }
 
     // ── Initialization ───────────────────────────────────────────────

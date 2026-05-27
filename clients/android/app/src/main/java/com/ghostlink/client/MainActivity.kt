@@ -300,9 +300,74 @@ class GhostlinkVM(application: Application) : AndroidViewModel(application) {
                         connStatus = "Waiting..."
                         connColor  = Color(0xFF888888)
                     }
+                    // v2.4.3 — actually fetch + decrypt inbound messages.
+                    // Pre-v2.4.3 Android was send-only.
+                    fetchAndDecrypt()
                 } catch (_: Exception) {
                     connStatus = "Server offline"; connColor = Color(0xFFff4757)
                 }
+            }
+        }
+    }
+
+    /**
+     * Poll the server for queued messages and decrypt them. Detects the
+     * v3 ratchet envelope by the "ratchet":1 marker and routes through
+     * RatchetSession.decryptFromPeer; otherwise falls back to the legacy
+     * static-AES path. Plaintext is the same {body,name,sender,ts} JSON
+     * shape send() produces on both clients.
+     */
+    private suspend fun fetchAndDecrypt() {
+        if (deviceID.isBlank()) return
+        val ctx = getApplication<Application>()
+        val r = withContext(Dispatchers.IO) {
+            NetworkClient.post("/api/v1/messages/fetch",
+                JSONObject().apply { put("device_id", deviceID) })
+        }
+        val arr = r.optJSONArray("messages") ?: return
+        for (i in 0 until arr.length()) {
+            val m = arr.optJSONObject(i) ?: continue
+            val sender = m.optString("sender_device_id", "")
+            val envField = m.opt("envelope")
+            val env: JSONObject = when (envField) {
+                is JSONObject -> envField
+                is String     -> try { JSONObject(envField) } catch (_: Throwable) { continue }
+                else -> continue
+            }
+            val plain: ByteArray? = if (env.optInt("ratchet", 0) == 1) {
+                val hex = env.optString("ciphertext", "")
+                if (hex.isBlank()) null
+                else RatchetSession.decryptFromPeer(ctx, sender, hex)
+            } else {
+                // Legacy static-AES path. Symmetric to send()'s fallback.
+                runCatching {
+                    val pkResp = withContext(Dispatchers.IO) {
+                        NetworkClient.post("/api/v1/devices/$sender/pubkey", JSONObject())
+                    }
+                    val pubHex = pkResp.optString("public_key", "")
+                    if (pubHex.isBlank()) null
+                    else {
+                        val peerPub = CryptoProvider.importPublicKey(pubHex.hexToBytes())
+                        val sk = CryptoProvider.deriveSessionKey(identityKey!!.private, peerPub)
+                        val iv  = env.getString("nonce").hexToBytes()
+                        val ct  = env.getString("ciphertext").hexToBytes()
+                        val tag = env.getString("tag").hexToBytes()
+                        CryptoProvider.decryptAESGCM(sk, iv, ct, tag)
+                    }
+                }.getOrNull()
+            }
+            if (plain == null) continue
+
+            try {
+                val obj = JSONObject(String(plain))
+                val body = obj.optString("body", "")
+                val name = obj.optString("name", "")
+                if (body.isNotBlank()) {
+                    messages = messages + Msg(sender, body, name = name.ifBlank { null })
+                }
+            } catch (_: Throwable) {
+                // Unparseable plaintext — drop. Could be a file envelope
+                // which goes through a different decoder in v2.5+.
             }
         }
     }
@@ -390,11 +455,31 @@ class GhostlinkVM(application: Application) : AndroidViewModel(application) {
                     if (dv.getString("id") == recip) { peerPub = CryptoProvider.importPublicKey(dv.getString("public_key").hexToBytes()); break }
                 }
                 if (peerPub == null) return@launch
-                val sk = CryptoProvider.deriveSessionKey(identityKey!!.private, peerPub)
                 val pl = JSONObject().apply { put("body",body); put("name",username); put("sender",deviceID); put("ts",System.currentTimeMillis()/1000) }.toString().toByteArray()
-                val (iv,ct,tg) = CryptoProvider.encryptAESGCM(sk, pl)
-                val sg = CryptoProvider.hmacSign(sk, ct)
-                val env = JSONObject().apply { put("sender",deviceID); put("ts",System.currentTimeMillis()/1000); put("nonce",iv.toHex()); put("ciphertext",ct.toHex()); put("tag",tg.toHex()); put("sig",sg.toHex()) }
+
+                // v2.4.3: prefer the Double Ratchet path. Falls back to the
+                // legacy static-AES envelope when the peer hasn't published
+                // a ratchet bundle yet (pre-v1.6 peer, or never logged in
+                // post-upgrade) — same logic as Windows v2.2.0.
+                val ctx = getApplication<Application>()
+                val ratchetHex = RatchetSession.encryptForPeer(ctx, recip, pl)
+                val env = if (ratchetHex != null) {
+                    val bin = ratchetHex.hexToBytes()
+                    val sig = java.security.MessageDigest.getInstance("SHA-256").digest(bin)
+                    JSONObject().apply {
+                        put("ratchet", 1)
+                        put("sender", deviceID); put("ts", System.currentTimeMillis()/1000)
+                        put("nonce",      "0".repeat(24))    // unused on ratchet path; schema-padding
+                        put("ciphertext", ratchetHex)
+                        put("tag",        "0".repeat(32))
+                        put("sig",        sig.toHex())
+                    }
+                } else {
+                    val sk = CryptoProvider.deriveSessionKey(identityKey!!.private, peerPub)
+                    val (iv,ct,tg) = CryptoProvider.encryptAESGCM(sk, pl)
+                    val sg = CryptoProvider.hmacSign(sk, ct)
+                    JSONObject().apply { put("sender",deviceID); put("ts",System.currentTimeMillis()/1000); put("nonce",iv.toHex()); put("ciphertext",ct.toHex()); put("tag",tg.toHex()); put("sig",sg.toHex()) }
+                }
                 val headers = if (disappearEnabled && disappearSeconds > 0)
                     mapOf("X-Expires-In" to disappearSeconds.toString()) else emptyMap()
                 val resp = NetworkClient.post(
